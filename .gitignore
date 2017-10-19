@@ -1,3 +1,7 @@
+# Compiled objects
+build/
+test/__pycache__
+
 # Prerequisites
 *.d
 
