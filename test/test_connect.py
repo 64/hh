@@ -1,18 +1,24 @@
 import socket
 import unittest
-import hh
+import time
 
 class TestConnect(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        hh.run_async()
-
     def test_connect(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(("localhost", 8000))
-        self.assertTrue(True) # Connect didn't fail
-        s.shutdown(socket.SHUT_RDWR)
-        s.close()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(("localhost", 8000))
+            s.shutdown(socket.SHUT_RDWR)
+        finally:
+            s.close()
+
+    def test_send(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(("localhost", 8000))
+            s.sendall("Hello libhh".encode())
+            s.shutdown(socket.SHUT_RDWR)
+        finally:
+            s.close()
 
 if __name__ == "__main__":
     unittest.main()
