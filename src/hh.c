@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -115,7 +116,7 @@ static int process_all_incoming_connections(int epoll_fd, int server_fd) {
 		char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
 
 		in_len = sizeof in_addr;
-		client_fd = accept(server_fd, &in_addr, &in_len);
+		client_fd = accept4(server_fd, &in_addr, &in_len, SOCK_NONBLOCK);
 		if (client_fd == -1) {
 			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
 				break; // Processed all connections
@@ -130,9 +131,6 @@ static int process_all_incoming_connections(int epoll_fd, int server_fd) {
 			printf("Accepted connection on descriptor %d "
 				"(host = %s, port = %s)\n", client_fd, hbuf, sbuf);
 		}
-
-		if (make_fd_non_blocking(client_fd) == -1)
-			return -1;
 
 		event.data.ptr = client_new(client_fd);
 		event.events = EPOLLIN | EPOLLET;
@@ -159,7 +157,7 @@ static int process_incoming_data(struct client *client) {
 
 		nread = read(fd, buf, sizeof buf);
 		if (nread == -1) {
-			if (errno != EAGAIN) {
+			if (errno != EAGAIN && errno != EWOULDBLOCK) {
 				perror("read");
 				done = true;
 			}
@@ -185,6 +183,7 @@ static int process_incoming_data(struct client *client) {
 	return 0;
 }
 
+// Main event loop
 int hh_listen(int server_fd) {
 	assert(server_fd >= 0);
 
@@ -219,7 +218,13 @@ int hh_listen(int server_fd) {
 		n = epoll_wait(epoll_fd, events, MAX_EVENTS, 300);
 		for (i = 0; i < n; i++) {
 			struct client *client = EVENT_CLIENT(events[i]);
-			if ((events[i].events & (EPOLLERR | EPOLLHUP | EPOLLIN)) != EPOLLIN) {
+			if (events[i].events & EPOLLRDHUP) {
+				fprintf(stderr, "client disconnected via EPOLLRDHUP\n");
+				close_client(client);
+			} else if (events[i].events & EPOLLHUP) {
+				fprintf(stderr, "client disconnected via EPOLLHUP\n");
+				close_client(client);
+			} else if (events[i].events & EPOLLERR) {
 				fprintf(stderr, "epoll error (flags %d)\n", events[i].events);
 				close_client(client);
 			} else if (server_fd == client->fd) {

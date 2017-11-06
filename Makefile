@@ -2,6 +2,7 @@ BUILD := build
 INCLUDE := include
 SRC := src
 TEST := test
+TEST_SERVER := test_server
 
 CFLAGS += -Wall -Wextra -Wpedantic -Iinclude -g
 LDLIBS += -ls2n -lcrypto -pthread
@@ -17,18 +18,19 @@ all: $(BUILD)/libhh.a $(BUILD)/libhh.so
 clean:
 	rm -rvf $(BUILD)
 
-run: all
+run: $(BUILD)/$(TEST_SERVER)
 	@echo "------------"
-	@python3 $(TEST)/run.py
+	@./$(BUILD)/$(TEST_SERVER)
 
-test: $(BUILD)/run
-	@./$(BUILD)/run &
-	@sleep 0.2
-	@for TEST in $(TESTS); do python3 $$TEST; done
-	@pkill --signal SIGINT -f "./$(BUILD)/run"
+test: $(BUILD)/$(TEST_SERVER)
+	@./$(BUILD)/$(TEST_SERVER) > $(BUILD)/output.log &
 	@sleep 0.3
+	@for TEST in $(TESTS); do python3 $$TEST; done
+	@killall --signal SIGINT -w "$(TEST_SERVER)"
+	@echo "----------- Server output -----------"
+	@cat $(BUILD)/output.log
 
-$(BUILD)/run: $(TEST)/run.c $(BUILD)/libhh.a
+$(BUILD)/$(TEST_SERVER): $(TEST)/run.c $(BUILD)/libhh.a
 	$(CC) $(TEST)/run.c -I $(CFLAGS) -o $@ -L$(BUILD) -l:libhh.a $(LDLIBS)
 
 $(BUILD)/libhh.a: $(BUILD) $(OBJS)

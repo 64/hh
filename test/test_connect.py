@@ -15,7 +15,7 @@ class TestConnect(unittest.TestCase):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect(("localhost", 8000))
-            s.sendall("Hello libhh".encode())
+            s.sendall("Hello libhh\n".encode())
             s.shutdown(socket.SHUT_RDWR)
         finally:
             s.close()
