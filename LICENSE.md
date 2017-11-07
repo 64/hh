@@ -1,4 +1,5 @@
-libhh -- Copyright 2017 Matt Taylor -- MIT license
+libhh         -- Copyright (c) 2017 Matt Taylor             -- MIT license
+C-Thread-Pool -- Copyright (c) 2016 Johan Hanssen Seferidis -- MIT license
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
