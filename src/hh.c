@@ -33,21 +33,6 @@ static int fd_queue[MAX_FD_QUEUE];
 static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t fd_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 
-
-static int make_fd_non_blocking(int fd) {
-	int flags;
-	if ((flags = fcntl(fd, F_GETFL, 0)) == -1) {
-		perror("fcntl");
-		return -1;
-	}
-	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) == -1) {
-		perror("fcntl");
-		return -1;
-	}
-	return 0;
-}
-
 static void sig_handler_quit(int signum) {
 	(void)signum;
 	worker_should_quit = 1;
@@ -77,7 +62,7 @@ int hh_init(void) {
 
 	// Bind to the first available
 	for(p = servinfo; p != NULL; p = p->ai_next) {
-		if ((server_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+		if ((server_fd = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol)) == -1) {
 			perror("socket");
 			continue;
 		}
@@ -92,9 +77,6 @@ int hh_init(void) {
 			perror("bind");
 			continue;
 		}
-
-		if (make_fd_non_blocking(server_fd) == -1)
-			return -1;
 
 		break;
 	}	
@@ -192,8 +174,9 @@ static int process_all_incoming_connections(int server_fd) {
 }
 
 static int close_client(struct client *client) {
+	int rv = close(client->fd);
 	client_free(client);
-	return close(client->fd);
+	return rv;
 }
 
 static int process_incoming_data(struct client *client) {
@@ -268,6 +251,8 @@ static void worker_event_loop(void *arg) {
 			}
 		}
 	}
+
+	free(events);
 }
 
 // Main event loop
@@ -275,8 +260,7 @@ int hh_listen(int server_fd) {
 	assert(server_fd >= 0);
 
 	struct epoll_event event;
-	int rv, epoll_fd;
-	(void)rv;
+	int epoll_fd;
 
 	if (listen(server_fd, SOMAXCONN) == -1) {
 		perror("listen");
@@ -284,6 +268,7 @@ int hh_listen(int server_fd) {
 	}
 
 	epoll_fd = epoll_create1(0);
+	memset(&event, 0, sizeof event);
 	event.data.fd = server_fd;
 	event.events = EPOLLIN | EPOLLET;
 	// This will be the only FD we poll on the main thread
