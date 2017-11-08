@@ -21,8 +21,8 @@
 
 #define DEFAULT_PORT "8000"
 #define MAX_EVENTS 64
-#define MAX_FD_QUEUE 128
-#define EPOLL_THREADS 2
+#define MAX_FD_QUEUE 4
+#define EPOLL_THREADS 3
 #define WORKER_THREADS 2
 #define EVENT_CLIENT(ev) ((struct client *)(ev).data.ptr)
 
@@ -144,7 +144,6 @@ static int process_all_incoming_connections(int server_fd) {
 		struct sockaddr in_addr;
 		socklen_t in_len;
 		int client_fd;
-		char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
 
 		in_len = sizeof in_addr;
 		client_fd = accept4(server_fd, &in_addr, &in_len, SOCK_NONBLOCK);
@@ -157,11 +156,11 @@ static int process_all_incoming_connections(int server_fd) {
 			}
 		}
 
-		if (getnameinfo(&in_addr, in_len, hbuf, sizeof hbuf, 
+		/*if (getnameinfo(&in_addr, in_len, hbuf, sizeof hbuf, 
 			sbuf, sizeof sbuf, NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
 			printf("Accepted connection on descriptor %d "
 				"(host = %s, port = %s)\n", client_fd, hbuf, sbuf);
-		}
+		}*/
 
 		// Send FD to other threads
 		if (queue_fd(client_fd) < 0) {
@@ -200,7 +199,8 @@ static int process_incoming_data(struct client *client) {
 
 		// Ready to read
 		pthread_mutex_lock(&stdout_lock);
-		int rv = write(1, buf, nread);
+	//	int rv = write(1, buf, nread);
+		int rv = 0;
 		pthread_mutex_unlock(&stdout_lock);
 		if (rv == -1) {
 			perror("write");
@@ -209,7 +209,7 @@ static int process_incoming_data(struct client *client) {
 	}
 
 	if (done) {
-		printf("Closed connection on descriptor %d\n", fd);
+		//printf("Closed connection on descriptor %d\n", fd);
 		if (close_client(client) != 0)
 			return -1;
 	}
@@ -217,7 +217,7 @@ static int process_incoming_data(struct client *client) {
 	return 0;
 }
 
-static void worker_event_loop(void *arg) {
+static void *worker_event_loop(void *arg) {
 	(void)arg;
 	int epoll_fd = epoll_create1(0);
 	struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
@@ -253,6 +253,7 @@ static void worker_event_loop(void *arg) {
 	}
 
 	free(events);
+	return NULL;
 }
 
 // Main event loop
@@ -277,17 +278,20 @@ int hh_listen(int server_fd) {
 		return -1;
 	}
 
-	// Initialise worker threads
-	threadpool pool = thpool_init(EPOLL_THREADS);
-
 	// Prepare signals
 	sig_prepare();
 
 	printf("Server waiting for connections on localhost:8000...\n");
 	
-	// Start worker threads TODO: don't use a thread pool for this
-	for (size_t i = 0; i < EPOLL_THREADS; i++)
-		thpool_add_work(pool,  worker_event_loop, NULL);
+	// Start worker threads
+	pthread_t worker_threads[EPOLL_THREADS];
+	for (size_t i = 0; i < EPOLL_THREADS; i++) {
+		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, NULL)) != 0) {
+			perror("pthread_create");
+			return -1;
+		}
+	}
+
 
 	// Event loop
 	while (!worker_should_quit) {
@@ -320,12 +324,18 @@ int hh_listen(int server_fd) {
 	}
 
 	printf("Server shutting down...\n");
-	worker_should_quit = 1;
 	if (close(epoll_fd) == -1)
 		return -1;
 
 	// Wait for worker threads to shut down
-	thpool_destroy(pool);
+	worker_should_quit = 1;
+	for (size_t i = 0; i < EPOLL_THREADS; i++) {
+		if ((errno = pthread_join(worker_threads[i], NULL)) != 0) {
+			perror("pthread_join");
+			return -1;
+		}
+	}
+
 	return 0;
 }
 
