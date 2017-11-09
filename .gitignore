@@ -1,6 +1,7 @@
 # Compiled objects
 build/
 test/__pycache__
+vgcore.*
 
 # Prerequisites
 *.d

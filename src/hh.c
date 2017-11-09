@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <netdb.h>
 #include <signal.h>
@@ -13,6 +14,7 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdint.h>
 #include <s2n.h>
 
 #include "hh.h"
@@ -21,9 +23,8 @@
 
 #define DEFAULT_PORT "8000"
 #define MAX_EVENTS 64
-#define MAX_FD_QUEUE 4
+#define MAX_FD_QUEUE 128
 #define EPOLL_THREADS 3
-#define WORKER_THREADS 2
 #define EVENT_CLIENT(ev) ((struct client *)(ev).data.ptr)
 
 static volatile sig_atomic_t worker_should_quit = 0;
@@ -99,7 +100,7 @@ int hh_init(void) {
 
 // TODO: Signal worker thread in case it is in the middle of epoll_wait
 // Returns -1 if need to drop connection
-static int queue_fd(int client_fd) {
+static int queue_fd(int event_fd, int client_fd) {
 	pthread_mutex_lock(&fd_queue_lock);
 	int new_head = (fd_queue_head + 1) % MAX_FD_QUEUE;
 	if (new_head == fd_queue_tail) {
@@ -111,35 +112,35 @@ static int queue_fd(int client_fd) {
 		fd_queue_head = new_head;
 	}
 	pthread_mutex_unlock(&fd_queue_lock);
+
+	// Signal we added one connection to the queue
+	uint64_t val = 1;
+	write(event_fd, &val, sizeof val);
 	return 0;
 }
 
 
-// TODO: Better load balancing, this function only consumes a single FD at a time
+// TODO: Better load balancing - need to rework this with one eventfd per thread
 static void consume_available_fd(int epoll_fd) {
-	if (pthread_mutex_trylock(&fd_queue_lock) == EBUSY)
-		return;
+	pthread_mutex_lock(&fd_queue_lock);
 	// Otherwise we now have the lock
-	if (fd_queue_tail == fd_queue_head) {
-		pthread_mutex_unlock(&fd_queue_lock);
-		return;
-	}
+	while (fd_queue_tail != fd_queue_head) {
+		// Grab the FD from the queue
+		int new_fd = fd_queue[fd_queue_tail];
+		fd_queue_tail = (fd_queue_tail + 1) % MAX_FD_QUEUE;
 
-	// There is one or more FDs to add
-	int new_fd = fd_queue[fd_queue_tail];
-	fd_queue_tail = (fd_queue_tail + 1) % MAX_FD_QUEUE;
+		// Add the FD to our epoll collection
+		struct epoll_event event;
+		event.data.ptr = client_new(new_fd);
+		event.events = EPOLLIN | EPOLLET;
+		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
+			perror("epoll_ctl");
+		}
+	}
 	pthread_mutex_unlock(&fd_queue_lock);
-
-	// Add the FD to our epoll collection
-	struct epoll_event event;
-	event.data.ptr = client_new(new_fd);
-	event.events = EPOLLIN | EPOLLET;
-	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
-		perror("epoll_ctl");
-	}
 }
 
-static int process_all_incoming_connections(int server_fd) {
+static int process_all_incoming_connections(int event_fd, int server_fd) {
 	while (1) {
 		struct sockaddr in_addr;
 		socklen_t in_len;
@@ -156,14 +157,8 @@ static int process_all_incoming_connections(int server_fd) {
 			}
 		}
 
-		/*if (getnameinfo(&in_addr, in_len, hbuf, sizeof hbuf, 
-			sbuf, sizeof sbuf, NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
-			printf("Accepted connection on descriptor %d "
-				"(host = %s, port = %s)\n", client_fd, hbuf, sbuf);
-		}*/
-
 		// Send FD to other threads
-		if (queue_fd(client_fd) < 0) {
+		if (queue_fd(event_fd, client_fd) < 0) {
 			fprintf(stderr, "No room in FD queue: dropping connection\n");
 			close(client_fd);
 		}
@@ -209,7 +204,6 @@ static int process_incoming_data(struct client *client) {
 	}
 
 	if (done) {
-		//printf("Closed connection on descriptor %d\n", fd);
 		if (close_client(client) != 0)
 			return -1;
 	}
@@ -222,11 +216,17 @@ static void *worker_event_loop(void *arg) {
 	int epoll_fd = epoll_create1(0);
 	struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
 
+	int event_fd = *(int *)arg; // Points to the eventfd - works since FD is first in struct
+	events[0].data.ptr = &event_fd; 
+	events[0].events = EPOLLIN | EPOLLET;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &events[0]) == -1) {
+		perror("epoll_ctl");
+	}
+
 	// Event loop
 	printf("Spawned worker thread\n");
 	while (!worker_should_quit) {
 		int n, i;
-		consume_available_fd(epoll_fd);
 		n = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);
 		if (n < 0 && errno == EINTR)
 			continue; // Need to recheck exit condition
@@ -242,8 +242,11 @@ static void *worker_event_loop(void *arg) {
 				fprintf(stderr, "epoll error (flags %d)\n", events[i].events);
 				close_client(client);
 			} else if (events[i].events & EPOLLIN) {
-				// We have data waiting
-				if (process_incoming_data(client) < 0)
+				if (client->fd == event_fd) {
+					uint64_t efd_read;
+					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
+						consume_available_fd(epoll_fd);
+				} else if (process_incoming_data(client) < 0)
 					continue;
 			} else {
 				fprintf(stderr, "Received unknown event %d\n", events[i].events);
@@ -261,7 +264,7 @@ int hh_listen(int server_fd) {
 	assert(server_fd >= 0);
 
 	struct epoll_event event;
-	int epoll_fd;
+	int epoll_fd, event_fd;
 
 	if (listen(server_fd, SOMAXCONN) == -1) {
 		perror("listen");
@@ -278,6 +281,9 @@ int hh_listen(int server_fd) {
 		return -1;
 	}
 
+	// Initialise eventfd
+	event_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
+
 	// Prepare signals
 	sig_prepare();
 
@@ -286,7 +292,7 @@ int hh_listen(int server_fd) {
 	// Start worker threads
 	pthread_t worker_threads[EPOLL_THREADS];
 	for (size_t i = 0; i < EPOLL_THREADS; i++) {
-		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, NULL)) != 0) {
+		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, &event_fd)) != 0) {
 			perror("pthread_create");
 			return -1;
 		}
@@ -315,7 +321,7 @@ int hh_listen(int server_fd) {
 			break;
 		} else if (server_fd == event.data.fd) {
 			// We have incoming connections
-			if (process_all_incoming_connections(server_fd) < 0)
+			if (process_all_incoming_connections(event_fd, server_fd) < 0)
 				return -1;
 		} else {
 			fprintf(stderr, "Received unknown event %d\n", event.events);
@@ -335,6 +341,9 @@ int hh_listen(int server_fd) {
 			return -1;
 		}
 	}
+
+	if (close(event_fd) == -1)
+		return -1;
 
 	return 0;
 }
