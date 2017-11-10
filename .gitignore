@@ -2,6 +2,7 @@
 build/
 test/__pycache__
 vgcore.*
+test/*.pem
 
 # Prerequisites
 *.d

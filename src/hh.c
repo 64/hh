@@ -23,16 +23,20 @@
 
 #define DEFAULT_PORT "8000"
 #define MAX_EVENTS 64
-#define MAX_FD_QUEUE 128
+#define MAX_FD_QUEUE 256
 #define EPOLL_THREADS 3
 #define EVENT_CLIENT(ev) ((struct client *)(ev).data.ptr)
 
 static volatile sig_atomic_t worker_should_quit = 0;
-static volatile int fd_queue_head, fd_queue_tail;
+static int fd_queue_head, fd_queue_tail;
 static int fd_queue[MAX_FD_QUEUE];
 
-static pthread_mutex_t stdout_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t fd_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *certificate_path = "test/cert.pem";
+static const char *pkey_path = "test/pkey.pem";
+
+static struct s2n_config *server_config;
 
 static void sig_handler_quit(int signum) {
 	(void)signum;
@@ -43,6 +47,51 @@ static void sig_prepare(void) {
 	signal(SIGTERM, sig_handler_quit);
 	signal(SIGINT, sig_handler_quit);
 	signal(SIGQUIT, sig_handler_quit);
+	signal(SIGPIPE, SIG_IGN); // Ignore this because it would make us crash
+}
+
+static int load_server_cert(void) {
+	server_config = s2n_config_new();
+	if (server_config == NULL) {
+		fprintf(stderr, "Failed to allocate s2n server config (check mlock permissions)\n");
+		return -1;
+	}
+
+	FILE *cert_file = fopen(certificate_path, "r");
+	FILE *pkey_file = fopen(pkey_path, "r");
+	if (cert_file == NULL) {
+		perror("fopen on cert file");
+		return -1;
+	} else if (pkey_file == NULL) {
+		perror("fopen on pkey file");
+		return -1;
+	}
+
+	// Read certificate file into buffer
+	fseek(cert_file, 0, SEEK_END);
+	long cert_size = ftell(cert_file);
+	fseek(cert_file, 0, SEEK_SET);
+	char *cert_data = malloc(cert_size + 1);
+	fread(cert_data, cert_size, 1, cert_file);
+	cert_data[cert_size] = '\0';
+
+	// Read private key file into buffer
+	fseek(pkey_file, 0, SEEK_END);
+	long pkey_size = ftell(pkey_file);
+	fseek(pkey_file, 0, SEEK_SET);
+	char *pkey_data = malloc(pkey_size + 1);
+	fread(pkey_data, pkey_size, 1, pkey_file);
+	pkey_data[pkey_size] = '\0';
+
+	if (s2n_config_add_cert_chain_and_key(server_config, cert_data, pkey_data) != 0) {
+		fprintf(stderr, "%s\n", s2n_strerror(s2n_errno, "EN"));
+		return -1;
+	} else
+		printf("Successfully loaded certificate and private key file\n");
+
+	free(cert_data);
+	free(pkey_data);
+	return 0;
 }
 
 
@@ -94,8 +143,17 @@ int hh_init(void) {
 		fprintf(stderr, "s2n_init: failed\n");
 		return -1;
 	}
+
+	if (load_server_cert() != 0)
+		return -1;
 	
 	return server_fd;
+}
+
+static int close_client(struct client *client) {
+	int rv = close(client->fd);
+	client_free(client);
+	return rv;
 }
 
 // TODO: Signal worker thread in case it is in the middle of epoll_wait
@@ -119,25 +177,31 @@ static int queue_fd(int event_fd, int client_fd) {
 	return 0;
 }
 
-
 // TODO: Better load balancing - need to rework this with one eventfd per thread
 static void consume_available_fd(int epoll_fd) {
 	pthread_mutex_lock(&fd_queue_lock);
 	// Otherwise we now have the lock
-	while (fd_queue_tail != fd_queue_head) {
+	if (fd_queue_tail != fd_queue_head) {
 		// Grab the FD from the queue
 		int new_fd = fd_queue[fd_queue_tail];
 		fd_queue_tail = (fd_queue_tail + 1) % MAX_FD_QUEUE;
+		pthread_mutex_unlock(&fd_queue_lock);
 
 		// Add the FD to our epoll collection
 		struct epoll_event event;
 		event.data.ptr = client_new(new_fd);
-		event.events = EPOLLIN | EPOLLET;
+		// Might fail due to mlock limits
+		if (event.data.ptr == NULL) {
+			close(new_fd);
+			return;
+
+		}
+		event.events = EPOLLIN | EPOLLOUT | EPOLLET;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
 			perror("epoll_ctl");
 		}
-	}
-	pthread_mutex_unlock(&fd_queue_lock);
+	} else
+		pthread_mutex_unlock(&fd_queue_lock);
 }
 
 static int process_all_incoming_connections(int event_fd, int server_fd) {
@@ -149,7 +213,7 @@ static int process_all_incoming_connections(int event_fd, int server_fd) {
 		in_len = sizeof in_addr;
 		client_fd = accept4(server_fd, &in_addr, &in_len, SOCK_NONBLOCK);
 		if (client_fd == -1) {
-			if ((errno == EAGAIN) || (errno == EWOULDBLOCK))
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break; // Processed all connections
 			else {
 				perror("accept");
@@ -167,18 +231,12 @@ static int process_all_incoming_connections(int event_fd, int server_fd) {
 	return 0;
 }
 
-static int close_client(struct client *client) {
-	int rv = close(client->fd);
-	client_free(client);
-	return rv;
-}
-
 static int process_incoming_data(struct client *client) {
 	bool done = false;
 	int fd = client->fd;
 	while (1) {
 		ssize_t nread;
-		char buf[512];
+		char buf[1024];
 
 		nread = read(fd, buf, sizeof buf);
 		if (nread == -1) {
@@ -191,28 +249,35 @@ static int process_incoming_data(struct client *client) {
 			done = true;
 			break;
 		}
-
-		// Ready to read
-		pthread_mutex_lock(&stdout_lock);
-	//	int rv = write(1, buf, nread);
-		int rv = 0;
-		pthread_mutex_unlock(&stdout_lock);
-		if (rv == -1) {
-			perror("write");
-			return -1;
-		}
 	}
 
 	if (done) {
-		if (close_client(client) != 0)
+		if (close_client(client) != 0) {
+			fprintf(stderr, "Close failed\n");
 			return -1;
+		}
 	}
 
 	return 0;
 }
 
+static int send_outgoing_data(struct client *client) {
+	// Should be 'while we still have pending data'
+	while (1) {
+		int rv = write(client->fd, "HELLO ", 6);
+		if (rv == -1) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			else {
+				close_client(client);
+				return -1;
+			}
+		}
+	}
+	return 0;
+}
+
 static void *worker_event_loop(void *arg) {
-	(void)arg;
 	int epoll_fd = epoll_create1(0);
 	struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
 
@@ -227,7 +292,7 @@ static void *worker_event_loop(void *arg) {
 	printf("Spawned worker thread\n");
 	while (!worker_should_quit) {
 		int n, i;
-		n = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);
+		n = epoll_wait(epoll_fd, events, MAX_EVENTS, 500);
 		if (n < 0 && errno == EINTR)
 			continue; // Need to recheck exit condition
 		for (i = 0; i < n; i++) {
@@ -246,8 +311,15 @@ static void *worker_event_loop(void *arg) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
 						consume_available_fd(epoll_fd);
-				} else if (process_incoming_data(client) < 0)
-					continue;
+				} else if (process_incoming_data(client) < 0) {
+					fprintf(stderr, "Failed to read incoming data\n");
+					break;
+				}
+			} else if (events[i].events & EPOLLOUT) {
+				if (send_outgoing_data(client) < 0) {
+					fprintf(stderr, "Failed to send outgoing data\n");
+					break;
+				}
 			} else {
 				fprintf(stderr, "Received unknown event %d\n", events[i].events);
 				continue;
@@ -352,6 +424,7 @@ int hh_cleanup(int server_fd) {
 	int rv = 0;
 	if (close(server_fd) == -1)
 		return -1;
+	s2n_config_free(server_config);
 	if ((rv = s2n_cleanup()) != 0)
 		return -1;
 	return 0;
