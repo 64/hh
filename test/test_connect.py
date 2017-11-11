@@ -1,21 +1,14 @@
 import socket
 import unittest
 import time
+import ssl
 
 class TestConnect(unittest.TestCase):
-    def test_connect(self):
+    def test_connect_tls(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s = ssl.wrap_socket(sock, ssl_version=ssl.PROTOCOL_TLS)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect(("localhost", 8000))
-            s.shutdown(socket.SHUT_RDWR)
-        finally:
-            s.close()
-
-    def test_send(self):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect(("localhost", 8000))
-            s.sendall("Hello libhh\n".encode())
             s.shutdown(socket.SHUT_RDWR)
         finally:
             s.close()

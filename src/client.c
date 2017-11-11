@@ -1,6 +1,9 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <s2n.h>
 #include "client.h"
+
+extern struct s2n_config *server_config;
 
 struct client *client_new(int fd) {
 	struct client *rv = malloc(sizeof(struct client));
@@ -10,7 +13,11 @@ struct client *client_new(int fd) {
 		goto cleanup; // Probably caused by mlock limits
 	}
 	s2n_connection_set_fd(rv->tls, fd);
+	s2n_connection_set_config(rv->tls, server_config);
+	s2n_connection_set_ctx(rv->tls, rv);
 	rv->fd = fd;
+	rv->state = HH_NEGOTIATING_TLS;
+	rv->blocked = S2N_NOT_BLOCKED;
 	return rv;
 cleanup:
 	free(rv);

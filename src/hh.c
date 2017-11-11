@@ -36,7 +36,7 @@ static pthread_mutex_t fd_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *certificate_path = "test/cert.pem";
 static const char *pkey_path = "test/pkey.pem";
 
-static struct s2n_config *server_config;
+struct s2n_config *server_config;
 
 static void sig_handler_quit(int signum) {
 	(void)signum;
@@ -152,6 +152,8 @@ int hh_init(void) {
 
 static int close_client(struct client *client) {
 	int rv = close(client->fd);
+	if (rv < 0)
+		perror("close client");
 	client_free(client);
 	return rv;
 }
@@ -233,47 +235,78 @@ static int process_all_incoming_connections(int event_fd, int server_fd) {
 
 static int process_incoming_data(struct client *client) {
 	bool done = false;
-	int fd = client->fd;
-	while (1) {
-		ssize_t nread;
-		char buf[1024];
-
-		nread = read(fd, buf, sizeof buf);
-		if (nread == -1) {
-			if (errno != EAGAIN && errno != EWOULDBLOCK) {
-				perror("read");
-				done = true;
+	switch (client->state) {
+		case HH_NEGOTIATING_TLS:
+			if (client->blocked == S2N_BLOCKED_ON_WRITE) {
+				fprintf(stderr, "Unexpected data on client socket\n");
+				goto error;
+			}
+			s2n_errno = S2N_ERR_T_OK;
+			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
+				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_BLOCKED:
+						break;
+					default:
+						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
+						goto error;
+				}
+			}
+			if (client->blocked == S2N_NOT_BLOCKED)
+				client->state = HH_IDLE;
+			break;
+		case HH_IDLE: {
+			char buf[1024];
+			ssize_t nread;
+			s2n_errno = S2N_ERR_T_OK;
+			if ((nread = s2n_recv(client->tls, buf, 1024, &client->blocked)) < 0) {
+				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_BLOCKED:
+						break;
+					default:
+						fprintf(stderr, "s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
+						goto error;
+				}
+			} else {
+				write(1, buf, nread);
 			}
 			break;
-		} else if (nread == 0) {
-			done = true;
+		} default:	
+			fprintf(stderr, "Unknown client state %d\n", client->state);
+			goto error;
 			break;
-		}
-	}
-
-	if (done) {
-		if (close_client(client) != 0) {
-			fprintf(stderr, "Close failed\n");
-			return -1;
-		}
 	}
 
 	return 0;
+error:
+	close_client(client);
+	return -1;
 }
 
 static int send_outgoing_data(struct client *client) {
-	// Should be 'while we still have pending data'
-	while (1) {
-		int rv = write(client->fd, "HELLO ", 6);
-		if (rv == -1) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
+	switch (client->state) {
+		case HH_NEGOTIATING_TLS:
+			if (client->blocked == S2N_BLOCKED_ON_READ)
 				break;
-			else {
-				close_client(client);
-				return -1;
+			s2n_errno = S2N_ERR_T_OK;
+			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
+				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_BLOCKED:
+						break;
+					default:
+						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
+						close_client(client);
+				}
 			}
-		}
-	}
+			if (client->blocked == S2N_NOT_BLOCKED)
+				client->state = HH_IDLE;
+			break;
+		case HH_IDLE:
+			break;
+		default:
+			fprintf(stderr, "Unknown client state %d\n", client->state);
+			close_client(client);
+			return -1;
+	} while (client->blocked != S2N_NOT_BLOCKED);
 	return 0;
 }
 

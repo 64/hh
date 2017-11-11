@@ -7,7 +7,7 @@ struct client {
 	enum {
 		HH_IDLE,
 		HH_NEGOTIATING_TLS
-	} status;
+	} state;
 	s2n_blocked_status blocked;
 };
 
