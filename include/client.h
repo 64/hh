@@ -13,3 +13,7 @@ struct client {
 
 struct client *client_new(int);
 void client_free(struct client *);
+int close_client(struct client *);
+
+int client_on_write_ready(struct client *);
+int client_on_data_received(struct client *);

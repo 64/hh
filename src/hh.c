@@ -17,7 +17,6 @@
 #include <stdint.h>
 #include <s2n.h>
 
-#include "hh.h"
 #include "client.h"
 #include "thpool.h"
 
@@ -37,6 +36,7 @@ static const char *certificate_path = "test/cert.pem";
 static const char *pkey_path = "test/pkey.pem";
 
 struct s2n_config *server_config;
+
 
 static void sig_handler_quit(int signum) {
 	(void)signum;
@@ -94,71 +94,6 @@ static int load_server_cert(void) {
 	return 0;
 }
 
-
-int hh_init(void) {
-	int rv = 0;
-	int server_fd, yes = 1;
-	struct addrinfo hints, *servinfo, *p;
-
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
-
-	if ((rv = getaddrinfo(NULL, DEFAULT_PORT, &hints, &servinfo)) != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-		return -1;
-	}
-
-	// Bind to the first available
-	for(p = servinfo; p != NULL; p = p->ai_next) {
-		if ((server_fd = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol)) == -1) {
-			perror("socket");
-			continue;
-		}
-
-		if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-			perror("setsockopt");
-			return -1;
-		}
-
-		if (bind(server_fd, p->ai_addr, p->ai_addrlen) == -1) {
-			close(server_fd);
-			perror("bind");
-			continue;
-		}
-
-		break;
-	}	
-
-	freeaddrinfo(servinfo);
-
-	if (p == NULL) {
-		fprintf(stderr, "bind: failed\n");
-		return -1;
-	}
-
-	// Initialise s2n
-	if ((rv = s2n_init()) != 0) {
-		fprintf(stderr, "s2n_init: failed\n");
-		return -1;
-	}
-
-	if (load_server_cert() != 0)
-		return -1;
-	
-	return server_fd;
-}
-
-static int close_client(struct client *client) {
-	int rv = close(client->fd);
-	if (rv < 0)
-		perror("close client");
-	client_free(client);
-	return rv;
-}
-
-// TODO: Signal worker thread in case it is in the middle of epoll_wait
 // Returns -1 if need to drop connection
 static int queue_fd(int event_fd, int client_fd) {
 	pthread_mutex_lock(&fd_queue_lock);
@@ -173,13 +108,13 @@ static int queue_fd(int event_fd, int client_fd) {
 	}
 	pthread_mutex_unlock(&fd_queue_lock);
 
-	// Signal we added one connection to the queue
+	// Signal that we added one connection to the queue (wakes up epoll watchers)
 	uint64_t val = 1;
 	write(event_fd, &val, sizeof val);
 	return 0;
 }
 
-// TODO: Better load balancing - need to rework this with one eventfd per thread
+// TODO: Better load balancing - may need to rework this with one eventfd per thread
 static void consume_available_fd(int epoll_fd) {
 	pthread_mutex_lock(&fd_queue_lock);
 	// Otherwise we now have the lock
@@ -233,83 +168,6 @@ static int process_all_incoming_connections(int event_fd, int server_fd) {
 	return 0;
 }
 
-static int process_incoming_data(struct client *client) {
-	bool done = false;
-	switch (client->state) {
-		case HH_NEGOTIATING_TLS:
-			if (client->blocked == S2N_BLOCKED_ON_WRITE) {
-				fprintf(stderr, "Unexpected data on client socket\n");
-				goto error;
-			}
-			s2n_errno = S2N_ERR_T_OK;
-			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
-				switch (s2n_error_get_type(s2n_errno)) {
-					case S2N_ERR_T_BLOCKED:
-						break;
-					default:
-						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
-						goto error;
-				}
-			}
-			if (client->blocked == S2N_NOT_BLOCKED)
-				client->state = HH_IDLE;
-			break;
-		case HH_IDLE: {
-			char buf[1024];
-			ssize_t nread;
-			s2n_errno = S2N_ERR_T_OK;
-			if ((nread = s2n_recv(client->tls, buf, 1024, &client->blocked)) < 0) {
-				switch (s2n_error_get_type(s2n_errno)) {
-					case S2N_ERR_T_BLOCKED:
-						break;
-					default:
-						fprintf(stderr, "s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
-						goto error;
-				}
-			} else {
-				write(1, buf, nread);
-			}
-			break;
-		} default:	
-			fprintf(stderr, "Unknown client state %d\n", client->state);
-			goto error;
-			break;
-	}
-
-	return 0;
-error:
-	close_client(client);
-	return -1;
-}
-
-static int send_outgoing_data(struct client *client) {
-	switch (client->state) {
-		case HH_NEGOTIATING_TLS:
-			if (client->blocked == S2N_BLOCKED_ON_READ)
-				break;
-			s2n_errno = S2N_ERR_T_OK;
-			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
-				switch (s2n_error_get_type(s2n_errno)) {
-					case S2N_ERR_T_BLOCKED:
-						break;
-					default:
-						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
-						close_client(client);
-				}
-			}
-			if (client->blocked == S2N_NOT_BLOCKED)
-				client->state = HH_IDLE;
-			break;
-		case HH_IDLE:
-			break;
-		default:
-			fprintf(stderr, "Unknown client state %d\n", client->state);
-			close_client(client);
-			return -1;
-	} while (client->blocked != S2N_NOT_BLOCKED);
-	return 0;
-}
-
 static void *worker_event_loop(void *arg) {
 	int epoll_fd = epoll_create1(0);
 	struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
@@ -344,13 +202,11 @@ static void *worker_event_loop(void *arg) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
 						consume_available_fd(epoll_fd);
-				} else if (process_incoming_data(client) < 0) {
-					fprintf(stderr, "Failed to read incoming data\n");
+				} else if (client_on_data_received(client) < 0) {
 					break;
 				}
 			} else if (events[i].events & EPOLLOUT) {
-				if (send_outgoing_data(client) < 0) {
-					fprintf(stderr, "Failed to send outgoing data\n");
+				if (client_on_write_ready(client) < 0) {
 					break;
 				}
 			} else {
@@ -364,8 +220,61 @@ static void *worker_event_loop(void *arg) {
 	return NULL;
 }
 
-// Main event loop
-int hh_listen(int server_fd) {
+static int server_init(void) {
+	int server_fd, yes = 1, rv = 0;
+	struct addrinfo hints, *servinfo, *p;
+
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+
+	if ((rv = getaddrinfo(NULL, DEFAULT_PORT, &hints, &servinfo)) != 0) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+		return -1;
+	}
+
+	// Bind to the first available
+	for(p = servinfo; p != NULL; p = p->ai_next) {
+		if ((server_fd = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol)) == -1) {
+			perror("socket");
+			continue;
+		}
+
+		if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+			perror("setsockopt");
+			return -1;
+		}
+
+		if (bind(server_fd, p->ai_addr, p->ai_addrlen) == -1) {
+			close(server_fd);
+			perror("bind");
+			continue;
+		}
+
+		break;
+	}	
+
+	freeaddrinfo(servinfo);
+
+	if (p == NULL) {
+		fprintf(stderr, "bind: failed\n");
+		return -1;
+	}
+
+	// Initialise s2n
+	if ((rv = s2n_init()) != 0) {
+		fprintf(stderr, "s2n_init: failed\n");
+		return -1;
+	}
+
+	if (load_server_cert() != 0)
+		return -1;
+	
+	return server_fd;
+}
+
+static int server_listen(int server_fd) {
 	assert(server_fd >= 0);
 
 	struct epoll_event event;
@@ -453,7 +362,7 @@ int hh_listen(int server_fd) {
 	return 0;
 }
 
-int hh_cleanup(int server_fd) {
+static int server_cleanup(int server_fd) {
 	int rv = 0;
 	if (close(server_fd) == -1)
 		return -1;
@@ -462,3 +371,15 @@ int hh_cleanup(int server_fd) {
 		return -1;
 	return 0;
 }
+
+int main(void) {
+	int fd;
+	if ((fd = server_init()) < 0)
+		return -1;
+	else if (server_listen(fd) < 0)
+		return -1;
+	else if (server_cleanup(fd) < 0)
+		return -1;
+	return 0;
+}
+

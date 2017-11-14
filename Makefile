@@ -2,7 +2,7 @@ BUILD := build
 INCLUDE := include
 SRC := src
 TEST := test
-TEST_SERVER := test_server
+EXE := hh
 
 CFLAGS += -Wall -Wextra -Wpedantic -Iinclude -g
 LDLIBS += -ls2n -lcrypto -pthread
@@ -13,45 +13,39 @@ TESTS := $(shell find $(TEST) -name "test_*.py")
 
 .PHONY: all clean run test valgrind stress
 
-all: $(BUILD)/libhh.a $(BUILD)/libhh.so
+all: $(BUILD)/$(EXE)
 
 clean:
 	rm -rvf $(BUILD)
 
-run: $(BUILD)/$(TEST_SERVER)
+run: $(BUILD)/$(EXE)
 	@echo "------------"
-	@./$(BUILD)/$(TEST_SERVER)
+	@./$(BUILD)/$(EXE)
 
-valgrind: $(BUILD)/$(TEST_SERVER)
-	@valgrind ./$(BUILD)/$(TEST_SERVER)
+valgrind: $(EXE)
+	@valgrind ./$(EXE)
 
-stress: $(BUILD)/$(TEST_SERVER)
-	@./$(BUILD)/$(TEST_SERVER) > $(BUILD)/output.log &
+stress: $(BUILD)/$(EXE)
+	@./$(BUILD)/$(EXE) > $(BUILD)/output.log &
 	@sleep 0.3
 	tcpkali -c 200 -m "Some message" localhost:8000 --latency-connect --latency-first-byte -T 20
-	@killall --signal SIGINT -w "$(TEST_SERVER)"
+	@killall --signal SIGINT -w "$(EXE)"
 	@echo "----------- Server output -----------"
 	@cat $(BUILD)/output.log
 
-test: $(BUILD)/$(TEST_SERVER)
-	@./$(BUILD)/$(TEST_SERVER) > $(BUILD)/output.log &
+test: $(BUILD)/$(EXE)
+	@./$(BUILD)/$(EXE) > $(BUILD)/output.log &
 	@sleep 0.3
 	@for TEST in $(TESTS); do python3 $$TEST; done
-	@killall --signal SIGINT -w "$(TEST_SERVER)"
+	@killall --signal SIGINT -w "$(EXE)"
 	@echo "----------- Server output -----------"
 	@cat $(BUILD)/output.log
 
-$(BUILD)/$(TEST_SERVER): $(TEST)/run.c $(BUILD)/libhh.a
-	$(CC) $(TEST)/run.c -I $(CFLAGS) -o $@ -L$(BUILD) -l:libhh.a $(LDLIBS)
-
-$(BUILD)/libhh.a: $(BUILD) $(OBJS)
-	$(AR) -rcs $(BUILD)/libhh.a $(OBJS)
-
-$(BUILD)/libhh.so: $(BUILD) $(OBJS)
-	$(CC) -shared $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
+$(BUILD)/$(EXE): $(BUILD) $(OBJS)
+	$(CC) $(CFLAGS) $(OBJS) -o $@ -L$(BUILD) $(LDLIBS)
 
 $(BUILD):
 	mkdir $@
 
 $(BUILD)/%.o: $(SRC)/%.c
-	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@

@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <s2n.h>
 #include "client.h"
 
@@ -30,4 +31,88 @@ void client_free(struct client *client) {
 			s2n_connection_free(client->tls);
 		free(client);
 	}
+}
+
+int close_client(struct client *client) {
+	int rv = close(client->fd);
+	if (rv < 0)
+		perror("close client");
+	client_free(client);
+	return rv;
+}
+
+int client_on_write_ready(struct client *client) {
+	switch (client->state) {
+		case HH_NEGOTIATING_TLS:
+			if (client->blocked == S2N_BLOCKED_ON_READ)
+				break;
+			s2n_errno = S2N_ERR_T_OK;
+			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
+				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_BLOCKED:
+						break;
+					default:
+						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
+						close_client(client);
+				}
+			}
+			if (client->blocked == S2N_NOT_BLOCKED)
+				client->state = HH_IDLE;
+			break;
+		case HH_IDLE:
+			break;
+		default:
+			fprintf(stderr, "Unknown client state %d\n", client->state);
+			close_client(client);
+			return -1;
+	} while (client->blocked != S2N_NOT_BLOCKED);
+	return 0;
+}
+
+int client_on_data_received(struct client *client) {
+	switch (client->state) {
+		case HH_NEGOTIATING_TLS:
+			if (client->blocked == S2N_BLOCKED_ON_WRITE) {
+				fprintf(stderr, "Unexpected data on client socket\n");
+				goto error;
+			}
+			s2n_errno = S2N_ERR_T_OK;
+			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
+				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_BLOCKED:
+						break;
+					default:
+						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
+						goto error;
+				}
+			}
+			if (client->blocked == S2N_NOT_BLOCKED)
+				client->state = HH_IDLE;
+			break;
+		case HH_IDLE: {
+			char buf[1024];
+			ssize_t nread;
+			s2n_errno = S2N_ERR_T_OK;
+			if ((nread = s2n_recv(client->tls, buf, 1024, &client->blocked)) < 0) {
+				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_BLOCKED:
+						break;
+					default:
+						fprintf(stderr, "s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
+						goto error;
+				}
+			} else {
+				write(1, buf, nread);
+			}
+			break;
+		} default:	
+			fprintf(stderr, "Unknown client state %d\n", client->state);
+			goto error;
+			break;
+	}
+
+	return 0;
+error:
+	close_client(client);
+	return -1;
 }
