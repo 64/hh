@@ -5,6 +5,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/epoll.h>
 #include <netdb.h>
 #include <signal.h>
@@ -26,8 +27,7 @@
 #define EPOLL_THREADS 3
 #define EVENT_CLIENT(ev) ((struct client *)(ev).data.ptr)
 
-static volatile sig_atomic_t worker_should_quit = 0;
-static int fd_queue_head, fd_queue_tail;
+static int fd_queue_head, fd_queue_tail, signal_fd;
 static int fd_queue[MAX_FD_QUEUE];
 
 static pthread_mutex_t fd_queue_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -37,17 +37,18 @@ static const char *pkey_path = "test/pkey.pem";
 
 struct s2n_config *server_config;
 
-
-static void sig_handler_quit(int signum) {
-	(void)signum;
-	worker_should_quit = 1;
-}
-
 static void sig_prepare(void) {
-	signal(SIGTERM, sig_handler_quit);
-	signal(SIGINT, sig_handler_quit);
-	signal(SIGQUIT, sig_handler_quit);
-	signal(SIGPIPE, SIG_IGN); // Ignore this because it would make us crash
+	sigset_t sigset;
+	sigemptyset(&sigset);
+	sigaddset(&sigset, SIGTERM);
+	sigaddset(&sigset, SIGINT);
+	sigaddset(&sigset, SIGQUIT);
+	signal_fd = signalfd(-1, &sigset, SFD_NONBLOCK);
+	if (signal_fd < 0)
+		exit(-1);
+
+	sigaddset(&sigset, SIGPIPE);
+	pthread_sigmask(SIG_BLOCK, &sigset, NULL);
 }
 
 static int load_server_cert(void) {
@@ -114,7 +115,7 @@ static int queue_fd(int event_fd, int client_fd) {
 	return 0;
 }
 
-// TODO: Better load balancing - may need to rework this with one eventfd per thread
+// TODO: Better load balancing - may need to rework this with one queue per thread
 static void consume_available_fd(int epoll_fd) {
 	pthread_mutex_lock(&fd_queue_lock);
 	// Otherwise we now have the lock
@@ -141,7 +142,7 @@ static void consume_available_fd(int epoll_fd) {
 		pthread_mutex_unlock(&fd_queue_lock);
 }
 
-static int process_all_incoming_connections(int event_fd, int server_fd) {
+static int process_all_incoming_connections(int *event_fds, int server_fd) {
 	while (1) {
 		struct sockaddr in_addr;
 		socklen_t in_len;
@@ -159,10 +160,14 @@ static int process_all_incoming_connections(int event_fd, int server_fd) {
 		}
 
 		// Send FD to other threads
-		if (queue_fd(event_fd, client_fd) < 0) {
+		static sig_atomic_t next_thread = 0;
+		if (queue_fd(event_fds[next_thread], client_fd) < 0) {
 			fprintf(stderr, "No room in FD queue: dropping connection\n");
 			close(client_fd);
 		}
+		// Wraparound to first thread
+		if (++next_thread == EPOLL_THREADS)
+			next_thread = 0;
 	}
 
 	return 0;
@@ -179,11 +184,19 @@ static void *worker_event_loop(void *arg) {
 		perror("epoll_ctl");
 	}
 
+	// Add the signal_fd to our set to epoll
+	events[0].data.ptr = &signal_fd;
+	events[0].events = EPOLLIN | EPOLLET;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_fd, &events[0]) == -1) {
+		perror("epoll_ctl");
+	}
+
 	// Event loop
 	printf("Spawned worker thread\n");
-	while (!worker_should_quit) {
+	int should_exit = 0;
+	while (!should_exit) {
 		int n, i;
-		n = epoll_wait(epoll_fd, events, MAX_EVENTS, 500);
+		n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 		if (n < 0 && errno == EINTR)
 			continue; // Need to recheck exit condition
 		for (i = 0; i < n; i++) {
@@ -202,12 +215,14 @@ static void *worker_event_loop(void *arg) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
 						consume_available_fd(epoll_fd);
+				} else if (client->fd == signal_fd) {
+					should_exit = 1; // Maybe we should check which signal?
 				} else if (client_on_data_received(client) < 0) {
 					break;
 				}
 			} else if (events[i].events & EPOLLOUT) {
 				if (client_on_write_ready(client) < 0) {
-					break;
+					continue;
 				}
 			} else {
 				fprintf(stderr, "Received unknown event %d\n", events[i].events);
@@ -277,36 +292,42 @@ static int server_init(void) {
 static int server_listen(int server_fd) {
 	assert(server_fd >= 0);
 
-	struct epoll_event event;
-	int epoll_fd, event_fd;
-
 	if (listen(server_fd, SOMAXCONN) == -1) {
 		perror("listen");
 		return -1;
 	}
 
-	epoll_fd = epoll_create1(0);
+	int epoll_fd = epoll_create1(0);
+	struct epoll_event event;
 	memset(&event, 0, sizeof event);
 	event.data.fd = server_fd;
 	event.events = EPOLLIN | EPOLLET;
-	// This will be the only FD we poll on the main thread
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
 		perror("epoll_ctl");
 		return -1;
 	}
 
-	// Initialise eventfd
-	event_fd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
-
 	// Prepare signals
 	sig_prepare();
+	event.data.fd = signal_fd;
+	event.events = EPOLLIN | EPOLLET;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_fd, &event) == -1) {
+		perror("epoll_ctl");
+		return -1;
+	}
+
+	// Initialise eventfds (one per worker thread)
+	int *event_fds = malloc(sizeof(int) * EPOLL_THREADS);
+	for (size_t i = 0; i < EPOLL_THREADS; i++) {
+		event_fds[i] = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
+	}
 
 	printf("Server waiting for connections on localhost:8000...\n");
 	
 	// Start worker threads
 	pthread_t worker_threads[EPOLL_THREADS];
 	for (size_t i = 0; i < EPOLL_THREADS; i++) {
-		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, &event_fd)) != 0) {
+		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, &event_fds[i])) != 0) {
 			perror("pthread_create");
 			return -1;
 		}
@@ -314,28 +335,27 @@ static int server_listen(int server_fd) {
 
 
 	// Event loop
-	while (!worker_should_quit) {
-		int n = epoll_wait(epoll_fd, &event, 1, 300);
+	while (1) {
+		int n = epoll_wait(epoll_fd, &event, 1, -1);
 		if (n == 0)
 			continue;
-		else if (n > 1) {
-			fprintf(stderr, "epoll: %d events on main thread, expected 0 or 1\n", n);
-			break;
-		} else if (n < 0) {
+		else if (n < 0) {
 			if (errno == EINTR)
 				continue; // Need to recheck exit condition
 			// TODO: Log error here
 			fprintf(stderr, "epoll: wait error (%d)\n", n);
 			break;
 		}
-		
+
 		// Now we have one event, in &event
-		if (event.events & EPOLLRDHUP || event.events & EPOLLHUP || event.events & EPOLLERR || !(event.events & EPOLLIN)) {
+		if (event.data.fd == signal_fd) {
+			break; // TODO: Handle
+		} else if (event.events & EPOLLRDHUP || event.events & EPOLLHUP || event.events & EPOLLERR || !(event.events & EPOLLIN)) {
 			fprintf(stderr, "Server received unexpected error %d\n", event.events);
 			break;
 		} else if (server_fd == event.data.fd) {
 			// We have incoming connections
-			if (process_all_incoming_connections(event_fd, server_fd) < 0)
+			if (process_all_incoming_connections(event_fds, server_fd) < 0)
 				return -1;
 		} else {
 			fprintf(stderr, "Received unknown event %d\n", event.events);
@@ -348,15 +368,18 @@ static int server_listen(int server_fd) {
 		return -1;
 
 	// Wait for worker threads to shut down
-	worker_should_quit = 1;
 	for (size_t i = 0; i < EPOLL_THREADS; i++) {
 		if ((errno = pthread_join(worker_threads[i], NULL)) != 0) {
 			perror("pthread_join");
 			return -1;
 		}
+		if (close(event_fds[i]) == -1) {
+			fprintf(stderr, "Failed to close eventfd of thread %zu\n", i);
+			return -1;
+		}
 	}
 
-	if (close(event_fd) == -1)
+	if (close(signal_fd) == -1)
 		return -1;
 
 	return 0;

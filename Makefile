@@ -11,7 +11,7 @@ SRCS := $(shell find $(SRC) -name "*.c")
 OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
 TESTS := $(shell find $(TEST) -name "test_*.py")
 
-.PHONY: all clean run test valgrind stress
+.PHONY: all clean run test valgrind
 
 all: $(BUILD)/$(EXE)
 
@@ -24,14 +24,6 @@ run: $(BUILD)/$(EXE)
 
 valgrind: $(EXE)
 	@valgrind ./$(EXE)
-
-stress: $(BUILD)/$(EXE)
-	@./$(BUILD)/$(EXE) > $(BUILD)/output.log &
-	@sleep 0.3
-	tcpkali -c 200 -m "Some message" localhost:8000 --latency-connect --latency-first-byte -T 20
-	@killall --signal SIGINT -w "$(EXE)"
-	@echo "----------- Server output -----------"
-	@cat $(BUILD)/output.log
 
 test: $(BUILD)/$(EXE)
 	@./$(BUILD)/$(EXE) > $(BUILD)/output.log &

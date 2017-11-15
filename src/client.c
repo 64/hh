@@ -65,7 +65,7 @@ int client_on_write_ready(struct client *client) {
 			fprintf(stderr, "Unknown client state %d\n", client->state);
 			close_client(client);
 			return -1;
-	} while (client->blocked != S2N_NOT_BLOCKED);
+	} 
 	return 0;
 }
 
