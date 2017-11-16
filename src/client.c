@@ -15,6 +15,7 @@ struct client *client_new(int fd) {
 	}
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
+	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
 	s2n_connection_set_ctx(rv->tls, rv);
 	rv->fd = fd;
 	rv->state = HH_NEGOTIATING_TLS;
@@ -41,6 +42,7 @@ int close_client(struct client *client) {
 	return rv;
 }
 
+// TODO: Use s2n's blinding when stuff fails
 int client_on_write_ready(struct client *client) {
 	switch (client->state) {
 		case HH_NEGOTIATING_TLS:
@@ -49,11 +51,20 @@ int client_on_write_ready(struct client *client) {
 			s2n_errno = S2N_ERR_T_OK;
 			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
 				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_CLOSED:
 					case S2N_ERR_T_BLOCKED:
 						break;
+					case S2N_ERR_T_ALERT:
+						fprintf(stderr, "s2n_negotiate: alert: %d\n", s2n_connection_get_alert(client->tls));
+						break;
+					case S2N_ERR_T_PROTO:
+						fprintf(stderr, "s2n_negotiate: protocol error\n");
+						goto error;
+					case S2N_ERR_T_IO:
+						goto error;
 					default:
 						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
-						close_client(client);
+						goto error;
 				}
 			}
 			if (client->blocked == S2N_NOT_BLOCKED)
@@ -67,6 +78,9 @@ int client_on_write_ready(struct client *client) {
 			return -1;
 	} 
 	return 0;
+error:
+	close_client(client);
+	return -1;
 }
 
 int client_on_data_received(struct client *client) {
@@ -79,8 +93,17 @@ int client_on_data_received(struct client *client) {
 			s2n_errno = S2N_ERR_T_OK;
 			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
 				switch (s2n_error_get_type(s2n_errno)) {
+					case S2N_ERR_T_CLOSED:
 					case S2N_ERR_T_BLOCKED:
 						break;
+					case S2N_ERR_T_ALERT:
+						fprintf(stderr, "s2n_negotiate: alert: %d\n", s2n_connection_get_alert(client->tls));
+						break;
+					case S2N_ERR_T_PROTO:
+						fprintf(stderr, "s2n_negotiate: protocol error\n");
+						goto error;
+					case S2N_ERR_T_IO:
+						goto error;
 					default:
 						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
 						goto error;

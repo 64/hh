@@ -58,6 +58,12 @@ static int load_server_cert(void) {
 		return -1;
 	}
 
+	// Set config and cipher suite preferences
+	if (s2n_config_set_cipher_preferences(server_config, "h2") < 0) {
+		fprintf(stderr, "Cannot find 'h2' cipher suite: you may need to apply a custom patch to s2n.\n");
+		return -1;
+	}
+
 	FILE *cert_file = fopen(certificate_path, "r");
 	FILE *pkey_file = fopen(pkey_path, "r");
 	if (cert_file == NULL) {
