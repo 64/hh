@@ -2,7 +2,11 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <s2n.h>
+#include <string.h>
+#include <errno.h>
+
 #include "client.h"
+#include "log.h"
 
 extern struct s2n_config *server_config;
 
@@ -10,7 +14,7 @@ struct client *client_new(int fd) {
 	struct client *rv = malloc(sizeof(struct client));
 	rv->tls = s2n_connection_new(S2N_SERVER);
 	if (rv->tls == NULL) {
-		fprintf(stderr, "s2n_connection_new: %s\n", s2n_strerror(s2n_errno, "EN"));
+		log_warn("Call to s2n_connection_new failed (%s)", s2n_strerror(s2n_errno, "EN"));
 		goto cleanup; // Probably caused by mlock limits
 	}
 	s2n_connection_set_fd(rv->tls, fd);
@@ -37,9 +41,32 @@ void client_free(struct client *client) {
 int close_client(struct client *client) {
 	int rv = close(client->fd);
 	if (rv < 0)
-		perror("close client");
+		log_warn("Call to close(client) failed (%s)", strerror(errno));
 	client_free(client);
 	return rv;
+}
+
+static int do_negotiate(struct client *client) {
+	s2n_errno = S2N_ERR_T_OK;
+	if (s2n_negotiate(client->tls, &client->blocked) < 0) {
+		switch (s2n_error_get_type(s2n_errno)) {
+			case S2N_ERR_T_CLOSED:
+			case S2N_ERR_T_BLOCKED:
+				break;
+			case S2N_ERR_T_ALERT:
+				log_warn("Call to s2n_negotiate gave alert %d", s2n_connection_get_alert(client->tls));
+				break;
+			case S2N_ERR_T_PROTO:
+				log_warn("Call to s2n_negotiate returned protocol error");
+				return -1;
+			case S2N_ERR_T_IO:
+				return -1;
+			default:
+				log_warn("Call to s2n_negotiate failed (%s)", s2n_strerror(s2n_errno, "EN"));
+				return -1;
+		}
+	}
+	return 0;
 }
 
 // TODO: Use s2n's blinding when stuff fails
@@ -48,34 +75,16 @@ int client_on_write_ready(struct client *client) {
 		case HH_NEGOTIATING_TLS:
 			if (client->blocked == S2N_BLOCKED_ON_READ)
 				break;
-			s2n_errno = S2N_ERR_T_OK;
-			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
-				switch (s2n_error_get_type(s2n_errno)) {
-					case S2N_ERR_T_CLOSED:
-					case S2N_ERR_T_BLOCKED:
-						break;
-					case S2N_ERR_T_ALERT:
-						fprintf(stderr, "s2n_negotiate: alert: %d\n", s2n_connection_get_alert(client->tls));
-						break;
-					case S2N_ERR_T_PROTO:
-						fprintf(stderr, "s2n_negotiate: protocol error\n");
-						goto error;
-					case S2N_ERR_T_IO:
-						goto error;
-					default:
-						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
-						goto error;
-				}
-			}
+			if (do_negotiate(client) < 0)
+				goto error;
 			if (client->blocked == S2N_NOT_BLOCKED)
 				client->state = HH_IDLE;
 			break;
 		case HH_IDLE:
 			break;
 		default:
-			fprintf(stderr, "Unknown client state %d\n", client->state);
-			close_client(client);
-			return -1;
+			log_warn("Unknown client state %d", client->state);
+			goto error;
 	} 
 	return 0;
 error:
@@ -90,25 +99,8 @@ int client_on_data_received(struct client *client) {
 				fprintf(stderr, "Unexpected data on client socket\n");
 				goto error;
 			}
-			s2n_errno = S2N_ERR_T_OK;
-			if (s2n_negotiate(client->tls, &client->blocked) < 0) {
-				switch (s2n_error_get_type(s2n_errno)) {
-					case S2N_ERR_T_CLOSED:
-					case S2N_ERR_T_BLOCKED:
-						break;
-					case S2N_ERR_T_ALERT:
-						fprintf(stderr, "s2n_negotiate: alert: %d\n", s2n_connection_get_alert(client->tls));
-						break;
-					case S2N_ERR_T_PROTO:
-						fprintf(stderr, "s2n_negotiate: protocol error\n");
-						goto error;
-					case S2N_ERR_T_IO:
-						goto error;
-					default:
-						fprintf(stderr, "s2n_negotiate: %s\n", s2n_strerror(s2n_errno, "EN"));
-						goto error;
-				}
-			}
+			if (do_negotiate(client) < 0)
+				goto error;
 			if (client->blocked == S2N_NOT_BLOCKED)
 				client->state = HH_IDLE;
 			break;
@@ -129,9 +121,8 @@ int client_on_data_received(struct client *client) {
 			}
 			break;
 		} default:	
-			fprintf(stderr, "Unknown client state %d\n", client->state);
+			log_warn("Unknown client state %d", client->state);
 			goto error;
-			break;
 	}
 
 	return 0;

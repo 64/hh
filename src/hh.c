@@ -20,6 +20,7 @@
 
 #include "client.h"
 #include "thpool.h"
+#include "log.h"
 
 #define DEFAULT_PORT "8000"
 #define MAX_EVENTS 64
@@ -54,23 +55,23 @@ static void sig_prepare(void) {
 static int load_server_cert(void) {
 	server_config = s2n_config_new();
 	if (server_config == NULL) {
-		fprintf(stderr, "Failed to allocate s2n server config (check mlock permissions)\n");
+		log_fatal("Failed to allocate s2n server config (check mlock permissions)");
 		return -1;
 	}
 
 	// Set config and cipher suite preferences
 	if (s2n_config_set_cipher_preferences(server_config, "h2") < 0) {
-		fprintf(stderr, "Cannot find 'h2' cipher suite: you may need to apply a custom patch to s2n.\n");
+		log_fatal("Cannot find 'h2' cipher suite: you may need to apply a custom patch to s2n.");
 		return -1;
 	}
 
 	FILE *cert_file = fopen(certificate_path, "r");
 	FILE *pkey_file = fopen(pkey_path, "r");
 	if (cert_file == NULL) {
-		perror("fopen on cert file");
+		log_fatal("Call to fopen on certificate file failed (%s)", strerror(errno));
 		return -1;
 	} else if (pkey_file == NULL) {
-		perror("fopen on pkey file");
+		log_fatal("Call to fopen on private key file failed (%s)", strerror(errno));
 		return -1;
 	}
 
@@ -91,10 +92,10 @@ static int load_server_cert(void) {
 	pkey_data[pkey_size] = '\0';
 
 	if (s2n_config_add_cert_chain_and_key(server_config, cert_data, pkey_data) != 0) {
-		fprintf(stderr, "%s\n", s2n_strerror(s2n_errno, "EN"));
+		log_fatal("Failed to add certificate/key to s2n (%s)", s2n_strerror(s2n_errno, "EN"));
 		return -1;
 	} else
-		printf("Successfully loaded certificate and private key file\n");
+		log_info("Successfully loaded certificate and private key file");
 
 	free(cert_data);
 	free(pkey_data);
@@ -142,7 +143,7 @@ static void consume_available_fd(int epoll_fd) {
 		}
 		event.events = EPOLLIN | EPOLLOUT | EPOLLET;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
-			perror("epoll_ctl");
+			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
 		}
 	} else
 		pthread_mutex_unlock(&fd_queue_lock);
@@ -160,7 +161,7 @@ static int process_all_incoming_connections(int *event_fds, int server_fd) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK)
 				break; // Processed all connections
 			else {
-				perror("accept");
+				log_warn("Call to accept failed (%s)", strerror(errno));
 				break;
 			}
 		}
@@ -168,7 +169,7 @@ static int process_all_incoming_connections(int *event_fds, int server_fd) {
 		// Send FD to other threads
 		static sig_atomic_t next_thread = 0;
 		if (queue_fd(event_fds[next_thread], client_fd) < 0) {
-			fprintf(stderr, "No room in FD queue: dropping connection\n");
+			log_warn("No room in FD queue: dropping connection");
 			close(client_fd);
 		}
 		// Wraparound to first thread
@@ -187,18 +188,20 @@ static void *worker_event_loop(void *arg) {
 	events[0].data.ptr = &event_fd; 
 	events[0].events = EPOLLIN | EPOLLET;
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &events[0]) == -1) {
-		perror("epoll_ctl");
+		log_fatal("Call to epoll_ctl failed (%s)", strerror(errno));
+		return NULL;
 	}
 
 	// Add the signal_fd to our set to epoll
 	events[0].data.ptr = &signal_fd;
 	events[0].events = EPOLLIN | EPOLLET;
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_fd, &events[0]) == -1) {
-		perror("epoll_ctl");
+		log_fatal("Call to epoll_ctl failed (%s)", strerror(errno));
+		return NULL;
 	}
 
 	// Event loop
-	printf("Spawned worker thread\n");
+	log_debug("Spawned worker thread");
 	int should_exit = 0;
 	while (!should_exit) {
 		int n, i;
@@ -208,13 +211,13 @@ static void *worker_event_loop(void *arg) {
 		for (i = 0; i < n; i++) {
 			struct client *client = EVENT_CLIENT(events[i]);
 			if (events[i].events & EPOLLRDHUP) {
-				fprintf(stderr, "client disconnected via EPOLLRDHUP\n");
+				log_warn("Client disconnected via EPOLLRDHUP");
 				close_client(client);
 			} else if (events[i].events & EPOLLHUP) {
-				fprintf(stderr, "client disconnected via EPOLLHUP\n");
+				log_warn("Client disconnected via EPOLLHUP");
 				close_client(client);
 			} else if (events[i].events & EPOLLERR) {
-				fprintf(stderr, "epoll error (flags %d)\n", events[i].events);
+				log_warn("Epoll event error (flags %d)", events[i].events);
 				close_client(client);
 			} else if (events[i].events & EPOLLIN) {
 				if (client->fd == event_fd) {
@@ -231,7 +234,7 @@ static void *worker_event_loop(void *arg) {
 					continue;
 				}
 			} else {
-				fprintf(stderr, "Received unknown event %d\n", events[i].events);
+				log_warn("Epoll event unknown (%d)", events[i].events);
 				continue;
 			}
 		}
@@ -251,25 +254,25 @@ static int server_init(void) {
 	hints.ai_flags = AI_PASSIVE;
 
 	if ((rv = getaddrinfo(NULL, DEFAULT_PORT, &hints, &servinfo)) != 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+		log_fatal("Call to getaddrinfo failed (%s)", gai_strerror(rv));
 		return -1;
 	}
 
 	// Bind to the first available
 	for(p = servinfo; p != NULL; p = p->ai_next) {
 		if ((server_fd = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol)) == -1) {
-			perror("socket");
+			log_warn("Call to socket failed (%s)", strerror(errno));
 			continue;
 		}
 
 		if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-			perror("setsockopt");
+			log_warn("Call to setsockopt failed (%s)", strerror(errno));
 			return -1;
 		}
 
 		if (bind(server_fd, p->ai_addr, p->ai_addrlen) == -1) {
 			close(server_fd);
-			perror("bind");
+			log_warn("Call to bind failed (%s)", strerror(errno));
 			continue;
 		}
 
@@ -279,18 +282,20 @@ static int server_init(void) {
 	freeaddrinfo(servinfo);
 
 	if (p == NULL) {
-		fprintf(stderr, "bind: failed\n");
+		log_fatal("Could not bind to any available socket");
 		return -1;
 	}
 
 	// Initialise s2n
 	if ((rv = s2n_init()) != 0) {
-		fprintf(stderr, "s2n_init: failed\n");
+		log_fatal("Call to s2n_init failed (%s)", s2n_strerror(s2n_errno, "EN"));
 		return -1;
 	}
 
-	if (load_server_cert() != 0)
+	if (load_server_cert() != 0) {
+		log_fatal("Failed to load server certificate and private key file");
 		return -1;
+	}
 	
 	return server_fd;
 }
@@ -299,7 +304,7 @@ static int server_listen(int server_fd) {
 	assert(server_fd >= 0);
 
 	if (listen(server_fd, SOMAXCONN) == -1) {
-		perror("listen");
+		log_fatal("Call to listen failed (%s)", strerror(errno));
 		return -1;
 	}
 
@@ -309,7 +314,7 @@ static int server_listen(int server_fd) {
 	event.data.fd = server_fd;
 	event.events = EPOLLIN | EPOLLET;
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
-		perror("epoll_ctl");
+		log_fatal("Call to epoll_ctl failed (%s)", strerror(errno));
 		return -1;
 	}
 
@@ -318,7 +323,7 @@ static int server_listen(int server_fd) {
 	event.data.fd = signal_fd;
 	event.events = EPOLLIN | EPOLLET;
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_fd, &event) == -1) {
-		perror("epoll_ctl");
+		log_fatal("Call to epoll_ctl failed (%s)", strerror(errno));
 		return -1;
 	}
 
@@ -328,13 +333,13 @@ static int server_listen(int server_fd) {
 		event_fds[i] = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
 	}
 
-	printf("Server waiting for connections on localhost:8000...\n");
+	log_info("Server waiting for connections on localhost:8000...");
 	
 	// Start worker threads
 	pthread_t worker_threads[EPOLL_THREADS];
 	for (size_t i = 0; i < EPOLL_THREADS; i++) {
 		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, &event_fds[i])) != 0) {
-			perror("pthread_create");
+			log_fatal("Call to pthread_create failed (%s)", strerror(errno));
 			return -1;
 		}
 	}
@@ -349,7 +354,7 @@ static int server_listen(int server_fd) {
 			if (errno == EINTR)
 				continue; // Need to recheck exit condition
 			// TODO: Log error here
-			fprintf(stderr, "epoll: wait error (%d)\n", n);
+			log_fatal("Call to epoll_wait failed (%s)", strerror(errno));
 			break;
 		}
 
@@ -357,47 +362,55 @@ static int server_listen(int server_fd) {
 		if (event.data.fd == signal_fd) {
 			break; // TODO: Handle
 		} else if (event.events & EPOLLRDHUP || event.events & EPOLLHUP || event.events & EPOLLERR || !(event.events & EPOLLIN)) {
-			fprintf(stderr, "Server received unexpected error %d\n", event.events);
+			log_fatal("Epoll event error (flags %d)", event.events);
 			break;
 		} else if (server_fd == event.data.fd) {
 			// We have incoming connections
 			if (process_all_incoming_connections(event_fds, server_fd) < 0)
 				return -1;
 		} else {
-			fprintf(stderr, "Received unknown event %d\n", event.events);
+			log_warn("Epoll event unknown (%d)", event.events);
 			return -1;
 		}
 	}
 
-	printf("Server shutting down...\n");
-	if (close(epoll_fd) == -1)
+	log_info("Server shutting down...");
+	if (close(epoll_fd) == -1) {
+		log_fatal("Call to close(epoll_fd) failed (%s)", strerror(errno));
 		return -1;
+	}
 
 	// Wait for worker threads to shut down
 	for (size_t i = 0; i < EPOLL_THREADS; i++) {
 		if ((errno = pthread_join(worker_threads[i], NULL)) != 0) {
-			perror("pthread_join");
+			log_fatal("Call to pthread_join failed (%s)", strerror(errno));
 			return -1;
 		}
 		if (close(event_fds[i]) == -1) {
-			fprintf(stderr, "Failed to close eventfd of thread %zu\n", i);
+			log_fatal("Failed to close eventfd of thread %zu (%s)", i, strerror(errno));
 			return -1;
 		}
 	}
 
-	if (close(signal_fd) == -1)
+	if (close(signal_fd) == -1) {
+		log_fatal("Call to close(signal_fd) failed (%s)", strerror(errno));
 		return -1;
+	}
 
 	return 0;
 }
 
 static int server_cleanup(int server_fd) {
 	int rv = 0;
-	if (close(server_fd) == -1)
+	if (close(server_fd) == -1) {
+		log_fatal("Call to close(server_fd) failed (%s)", strerror(errno));
 		return -1;
+	}
 	s2n_config_free(server_config);
-	if ((rv = s2n_cleanup()) != 0)
+	if ((rv = s2n_cleanup()) != 0) {
+		log_fatal("Call to s2n_cleanup failed (%s)", s2n_strerror(s2n_errno, "EN"));
 		return -1;
+	}
 	return 0;
 }
 

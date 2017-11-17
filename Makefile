@@ -4,12 +4,13 @@ SRC := src
 TEST := test
 EXE := hh
 
-CFLAGS += -Wall -Wextra -Wpedantic -Iinclude -g
+CFLAGS += -Wall -Wextra -std=c11 -Iinclude -g
 LDLIBS += -ls2n -lcrypto -pthread
 
 SRCS := $(shell find $(SRC) -name "*.c")
 OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
 TESTS := $(shell find $(TEST) -name "test_*.py")
+DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 
 .PHONY: all clean run test valgrind
 
@@ -40,4 +41,6 @@ $(BUILD):
 	mkdir $@
 
 $(BUILD)/%.o: $(SRC)/%.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@ -MD
+
+-include $(DEPFILES)
