@@ -18,7 +18,6 @@ struct client *client_new(int fd) {
 		log_warn("Call to s2n_connection_new failed (%s)", s2n_strerror(s2n_errno, "EN"));
 		goto cleanup; // Probably caused by mlock limits
 	}
-	log_trace();
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
 	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
@@ -34,7 +33,6 @@ cleanup:
 
 void client_free(struct client *client) {
 	if (client != NULL) {
-		log_trace();
 		s2n_connection_free(client->tls);
 		free(client);
 	}

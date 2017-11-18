@@ -58,7 +58,6 @@ static int load_server_cert(void) {
 		log_fatal("Failed to allocate s2n server config (check mlock permissions)");
 		return -1;
 	}
-	log_trace();
 
 	// Set config and cipher suite preferences
 	if (s2n_config_set_cipher_preferences(server_config, "h2") < 0) {
@@ -250,6 +249,10 @@ static void *worker_event_loop(void *arg) {
 		}
 	}
 
+	log_trace();
+	if (s2n_cleanup() < 0)
+		log_warn("Call to s2n_cleanup failed on worker thread (%s)", s2n_strerror(s2n_errno, "EN"));
+
 	free(events);
 	return NULL;
 }
@@ -363,7 +366,6 @@ static int server_listen(int server_fd) {
 		else if (n < 0) {
 			if (errno == EINTR)
 				continue; // Need to recheck exit condition
-			// TODO: Log error here
 			log_fatal("Call to epoll_wait failed (%s)", strerror(errno));
 			break;
 		}
@@ -420,10 +422,9 @@ static int server_cleanup(int server_fd) {
 	}
 	s2n_config_free(server_config);
 	if ((rv = s2n_cleanup()) != 0) {
-		log_fatal("Call to s2n_cleanup failed (%s)", s2n_strerror(s2n_errno, "EN"));
+		log_fatal("Call to s2n_cleanup on main thread failed (%s)", s2n_strerror(s2n_errno, "EN"));
 		return -1;
 	}
-	log_trace();
 	return 0;
 }
 
