@@ -58,6 +58,7 @@ static int load_server_cert(void) {
 		log_fatal("Failed to allocate s2n server config (check mlock permissions)");
 		return -1;
 	}
+	log_trace();
 
 	// Set config and cipher suite preferences
 	if (s2n_config_set_cipher_preferences(server_config, "h2") < 0) {
@@ -422,6 +423,7 @@ static int server_cleanup(int server_fd) {
 		log_fatal("Call to s2n_cleanup failed (%s)", s2n_strerror(s2n_errno, "EN"));
 		return -1;
 	}
+	log_trace();
 	return 0;
 }
 
