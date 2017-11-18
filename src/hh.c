@@ -65,6 +65,13 @@ static int load_server_cert(void) {
 		return -1;
 	}
 
+	// Set ALPN to negotiate h2 (HTTP/2) protocol
+	const char *proto_name = "h2";
+	if (s2n_config_set_protocol_preferences(server_config, &proto_name, 1) < 0) {
+		log_fatal("Cannot set ALPN identifier to 'h2' (%s)", s2n_strerror(s2n_errno, "EN"));
+		return -1;
+	}
+
 	FILE *cert_file = fopen(certificate_path, "r");
 	FILE *pkey_file = fopen(pkey_path, "r");
 	if (cert_file == NULL) {
@@ -99,6 +106,8 @@ static int load_server_cert(void) {
 
 	free(cert_data);
 	free(pkey_data);
+	fclose(cert_file);
+	fclose(pkey_file);
 	return 0;
 }
 
@@ -391,6 +400,8 @@ static int server_listen(int server_fd) {
 			return -1;
 		}
 	}
+
+	free(event_fds);
 
 	if (close(signal_fd) == -1) {
 		log_fatal("Call to close(signal_fd) failed (%s)", strerror(errno));

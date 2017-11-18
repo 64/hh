@@ -23,8 +23,8 @@ run: $(BUILD)/$(EXE)
 	@echo "------------"
 	@./$(BUILD)/$(EXE)
 
-valgrind: $(EXE)
-	@valgrind ./$(EXE)
+valgrind: $(BUILD)/$(EXE)
+	@valgrind ./$(BUILD)/$(EXE)
 
 test: $(BUILD)/$(EXE)
 	@./$(BUILD)/$(EXE) > $(BUILD)/output.log &
