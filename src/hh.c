@@ -249,10 +249,6 @@ static void *worker_event_loop(void *arg) {
 		}
 	}
 
-	log_trace();
-	if (s2n_cleanup() < 0)
-		log_warn("Call to s2n_cleanup failed on worker thread (%s)", s2n_strerror(s2n_errno, "EN"));
-
 	free(events);
 	return NULL;
 }
