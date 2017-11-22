@@ -46,9 +46,66 @@ int close_client(struct client *client) {
 	return rv;
 }
 
+// Big state machine.
+static int change_state(struct client *client, enum client_state to) {
+	switch (client->state) {
+		case HH_IDLE:
+			switch (to) {
+				case HH_SHUTTING_DOWN:
+					client->state = to;
+					break;
+				default:
+					goto verybad;
+			}
+			break;
+		case HH_NEGOTIATING_TLS:
+			switch (to) {
+				case HH_IDLE:
+					client->state = to;
+					break;
+				default:
+					goto verybad;
+			}
+			break;
+		case HH_SHUTTING_DOWN:
+			if (to == HH_SHUTTING_DOWN)
+				break; // Treat this as a no-op for simplicity
+			__attribute__((fallthrough));
+		verybad:
+		default:
+#ifdef NDEBUG
+			__builtin_unreachable(); // Helps the optimizer
+#else
+			log_fatal("You reached the unreachable, this is very bad.");
+			log_trace();
+			exit(-1);
+#endif
+	}
+	return 0;
+}
+
+// Initiates a graceful shutdown
+static int send_shutdown(struct client *client) {
+	if (s2n_shutdown(client->tls, &client->blocked) < 0) {
+		switch(s2n_error_get_type(s2n_errno)) {
+			case S2N_ERR_T_BLOCKED:
+				change_state(client, HH_SHUTTING_DOWN);
+				return 0;
+			default:
+				log_warn("Call to s2n_shutdown failed (%s)", s2n_strerror(s2n_errno, "EN"));
+				close_client(client);
+				return -1;
+		}
+	}
+	// Graceful shutdown was successful, we can close now
+	close_client(client);
+	return 0;
+}
+
 static int do_negotiate(struct client *client) {
 	assert(client->state == HH_NEGOTIATING_TLS);
 	s2n_errno = S2N_ERR_T_OK;
+	errno = 0;
 	if (s2n_negotiate(client->tls, &client->blocked) < 0) {
 		switch (s2n_error_get_type(s2n_errno)) {
 			case S2N_ERR_T_CLOSED:
@@ -62,7 +119,10 @@ static int do_negotiate(struct client *client) {
 				log_warn("Call to s2n_negotiate returned protocol error");
 				return -1;
 			case S2N_ERR_T_IO:
-				log_warn("Call to s2n_negotiate returned IO error");
+				// I suppose if ALPN fails, then negotiate will return an error when successful
+				// Skip printing a warning if this happens, but still close the connection.
+				if (errno != 0)	
+					log_warn("Call to s2n_negotiate returned IO error");
 				return -1;
 			default:
 				log_warn("Call to s2n_negotiate failed (%s)", s2n_strerror(s2n_errno, "EN"));
@@ -81,9 +141,12 @@ int client_on_write_ready(struct client *client) {
 			if (do_negotiate(client) < 0)
 				goto error;
 			if (client->blocked == S2N_NOT_BLOCKED)
-				client->state = HH_IDLE;
+				change_state(client, HH_IDLE);
 			break;
 		case HH_IDLE:
+			break;
+		case HH_SHUTTING_DOWN:
+			send_shutdown(client);
 			break;
 		default:
 			log_warn("Unknown client state %d", client->state);
@@ -105,7 +168,7 @@ int client_on_data_received(struct client *client) {
 			if (do_negotiate(client) < 0)
 				goto error;
 			if (client->blocked == S2N_NOT_BLOCKED)
-				client->state = HH_IDLE;
+				change_state(client, HH_IDLE);
 			break;
 		case HH_IDLE: {
 			char buf[1024];
@@ -126,7 +189,10 @@ int client_on_data_received(struct client *client) {
 				write(1, buf, nread);
 			}
 			break;
-		} default:	
+		} case HH_SHUTTING_DOWN:
+			send_shutdown(client);
+			break;
+		default:	
 			log_warn("Unknown client state %d", client->state);
 			goto error;
 	}

@@ -4,9 +4,10 @@
 struct client {
 	int fd; // This must be first, because of a little epoll hack we use
 	struct s2n_connection *tls;
-	enum {
+	enum client_state {
 		HH_IDLE,
-		HH_NEGOTIATING_TLS
+		HH_NEGOTIATING_TLS,
+		HH_SHUTTING_DOWN
 	} state;
 	s2n_blocked_status blocked;
 };

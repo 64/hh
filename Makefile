@@ -12,12 +12,20 @@ OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
 TESTS := $(shell find $(TEST) -name "test_*.py")
 DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 
-.PHONY: all clean run test valgrind
+.PHONY: all clean run test valgrind rebuild
+
+ifeq ($(HH_DEBUG),1)
+  CFLAGS += -O0 -fsanitize=address,undefined
+else
+  CFLAGS += -O2 -DNDEBUG
+endif
 
 all: $(BUILD)/$(EXE)
 
 clean:
 	rm -rvf $(BUILD)
+
+rebuild: clean all
 
 run: $(BUILD)/$(EXE)
 	@echo "------------"
