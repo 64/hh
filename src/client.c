@@ -20,7 +20,7 @@ struct client *client_new(int fd) {
 	}
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
-	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
+	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING); // TODO: Implement blinding
 	s2n_connection_set_ctx(rv->tls, rv);
 	rv->fd = fd;
 	rv->state = HH_NEGOTIATING_TLS;
@@ -33,7 +33,7 @@ cleanup:
 
 void client_free(struct client *client) {
 	if (client != NULL) {
-		s2n_connection_free(client->tls);
+		s2n_connection_free(client->tls); // TODO: Wipe the connection, don't free it
 		free(client);
 	}
 }
@@ -119,7 +119,7 @@ static int do_negotiate(struct client *client) {
 				log_warn("Call to s2n_negotiate returned protocol error");
 				return -1;
 			case S2N_ERR_T_IO:
-				// I suppose if ALPN fails, then negotiate will return an error when successful
+				// I suppose if ALPN fails, then negotiate will return an error even when successful
 				// Skip printing a warning if this happens, but still close the connection.
 				if (errno != 0)	
 					log_warn("Call to s2n_negotiate returned IO error");
@@ -132,7 +132,6 @@ static int do_negotiate(struct client *client) {
 	return 0;
 }
 
-// TODO: Use s2n's blinding when stuff fails
 int client_on_write_ready(struct client *client) {
 	switch (client->state) {
 		case HH_NEGOTIATING_TLS:
@@ -149,8 +148,12 @@ int client_on_write_ready(struct client *client) {
 			send_shutdown(client);
 			break;
 		default:
-			log_warn("Unknown client state %d", client->state);
-			goto error;
+#ifdef NDEBUG
+			__builtin_unreachable();
+#else
+			log_fatal("Unknown client state %d", client->state);
+			exit(-1);
+#endif
 	} 
 	return 0;
 error:
@@ -193,8 +196,12 @@ int client_on_data_received(struct client *client) {
 			send_shutdown(client);
 			break;
 		default:	
-			log_warn("Unknown client state %d", client->state);
-			goto error;
+#ifdef NDEBUG
+			__builtin_unreachable();
+#else
+			log_fatal("Unknown client state %d", client->state);
+			exit(-1);
+#endif
 	}
 
 	return 0;

@@ -4,7 +4,7 @@ SRC := src
 TEST := test
 EXE := hh
 
-CFLAGS += -Wall -Wextra -std=c11 -Iinclude -g
+CFLAGS += -Wall -Wextra -std=c11 -Iinclude -g -DWORKER_THREADS=3
 LDLIBS += -ls2n -lcrypto -pthread
 
 SRCS := $(shell find $(SRC) -name "*.c")
@@ -12,7 +12,7 @@ OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
 TESTS := $(shell find $(TEST) -name "test_*.py")
 DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 
-.PHONY: all clean run test valgrind rebuild
+.PHONY: all clean run test valgrind rebuild cloc
 
 ifeq ($(HH_DEBUG),1)
   CFLAGS += -O0 -fsanitize=address,undefined
@@ -27,9 +27,12 @@ clean:
 
 rebuild: clean all
 
+cloc:
+	@cloc . --not-match-d="build"
+
 run: $(BUILD)/$(EXE)
 	@echo "------------"
-	@./$(BUILD)/$(EXE)
+	@./$(BUILD)/$(EXE) 8000
 
 valgrind: $(BUILD)/$(EXE)
 	@valgrind ./$(BUILD)/$(EXE)

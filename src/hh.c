@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <signal.h>
 #include <pthread.h>
+#include <limits.h>
 #include <errno.h>
 #include <string.h>
 #include <assert.h>
@@ -19,13 +20,12 @@
 #include <s2n.h>
 
 #include "client.h"
-#include "thpool.h"
 #include "log.h"
 
-#define DEFAULT_PORT "8000"
+#define DEFAULT_PORT 8000
 #define MAX_EVENTS 64
 #define MAX_FD_QUEUE 256
-#define EPOLL_THREADS 3
+#define WORKER_THREADS 3
 #define EVENT_CLIENT(ev) ((struct client *)(ev).data.ptr)
 
 static int fd_queue_head, fd_queue_tail, signal_fd;
@@ -182,7 +182,7 @@ static int process_all_incoming_connections(int *event_fds, int server_fd) {
 			close(client_fd);
 		}
 		// Wraparound to first thread
-		if (++next_thread == EPOLL_THREADS)
+		if (++next_thread == WORKER_THREADS)
 			next_thread = 0;
 	}
 
@@ -253,7 +253,7 @@ static void *worker_event_loop(void *arg) {
 	return NULL;
 }
 
-static int server_init(void) {
+static int server_init(unsigned short port) {
 	int server_fd, yes = 1, rv = 0;
 	struct addrinfo hints, *servinfo, *p;
 
@@ -262,7 +262,10 @@ static int server_init(void) {
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_flags = AI_PASSIVE;
 
-	if ((rv = getaddrinfo(NULL, DEFAULT_PORT, &hints, &servinfo)) != 0) {
+	char port_buf[6];
+	snprintf(port_buf, 6, "%hu", port);
+
+	if ((rv = getaddrinfo(NULL, port_buf, &hints, &servinfo)) != 0) {
 		log_fatal("Call to getaddrinfo failed (%s)", gai_strerror(rv));
 		return -1;
 	}
@@ -309,7 +312,7 @@ static int server_init(void) {
 	return server_fd;
 }
 
-static int server_listen(int server_fd) {
+static int server_listen(int server_fd, unsigned short port) {
 	assert(server_fd >= 0);
 
 	if (listen(server_fd, SOMAXCONN) == -1) {
@@ -337,16 +340,16 @@ static int server_listen(int server_fd) {
 	}
 
 	// Initialise eventfds (one per worker thread)
-	int *event_fds = malloc(sizeof(int) * EPOLL_THREADS);
-	for (size_t i = 0; i < EPOLL_THREADS; i++) {
+	int *event_fds = malloc(sizeof(int) * WORKER_THREADS);
+	for (size_t i = 0; i < WORKER_THREADS; i++) {
 		event_fds[i] = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE);
 	}
 
-	log_info("Server waiting for connections on localhost:8000...");
+	log_info("Server waiting for connections on localhost:%hu...", port);
 	
 	// Start worker threads
-	pthread_t worker_threads[EPOLL_THREADS];
-	for (size_t i = 0; i < EPOLL_THREADS; i++) {
+	pthread_t worker_threads[WORKER_THREADS];
+	for (size_t i = 0; i < WORKER_THREADS; i++) {
 		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, &event_fds[i])) != 0) {
 			log_fatal("Call to pthread_create failed (%s)", strerror(errno));
 			return -1;
@@ -389,7 +392,7 @@ static int server_listen(int server_fd) {
 	}
 
 	// Wait for worker threads to shut down
-	for (size_t i = 0; i < EPOLL_THREADS; i++) {
+	for (size_t i = 0; i < WORKER_THREADS; i++) {
 		if ((errno = pthread_join(worker_threads[i], NULL)) != 0) {
 			log_fatal("Call to pthread_join failed (%s)", strerror(errno));
 			return -1;
@@ -424,11 +427,25 @@ static int server_cleanup(int server_fd) {
 	return 0;
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
 	int fd;
-	if ((fd = server_init()) < 0)
+	// Parse port number from command line option
+	unsigned short port_num = DEFAULT_PORT;
+	if (argc > 2) {
+		log_fatal("Usage: hh [port]");
 		return -1;
-	else if (server_listen(fd) < 0)
+	} else if (argc == 2) {
+		char *endptr;
+		long temp = strtoul(argv[1], &endptr, 10);
+		if (*endptr != '\0' || temp > USHRT_MAX) {
+			log_fatal("Invalid port number '%s'.", argv[1]);
+			return -1;
+		} else
+			port_num = (unsigned short)temp;
+	}
+	if ((fd = server_init(port_num)) < 0)
+		return -1;
+	else if (server_listen(fd, port_num) < 0)
 		return -1;
 	else if (server_cleanup(fd) < 0)
 		return -1;
