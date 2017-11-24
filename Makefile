@@ -4,7 +4,7 @@ SRC := src
 TEST := test
 EXE := hh
 
-CFLAGS += -Wall -Wextra -std=c11 -Iinclude -g -DWORKER_THREADS=3
+CFLAGS += -Wall -Wextra -std=gnu11 -Iinclude -g -DWORKER_THREADS=3
 LDLIBS += -ls2n -lcrypto -pthread
 
 SRCS := $(shell find $(SRC) -name "*.c")
