@@ -12,7 +12,7 @@ OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
 TESTS := $(shell find $(TEST) -name "test_*.py")
 DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 
-.PHONY: all clean run test valgrind rebuild cloc
+.PHONY: all clean run test valgrind rebuild cloc hexdump
 
 ifeq ($(HH_DEBUG),1)
   CFLAGS += -O0 -fsanitize=address,undefined
@@ -29,6 +29,9 @@ rebuild: clean all
 
 cloc:
 	@cloc . --not-match-d="build"
+
+hexdump: $(BUILD)/$(EXE)
+	@./$(BUILD)/$(EXE) 2>&1 >/dev/null | hexdump -e '1/1 " %02X"' -C
 
 run: $(BUILD)/$(EXE)
 	@echo "------------"

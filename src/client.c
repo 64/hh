@@ -31,6 +31,7 @@ struct client *client_new(int fd) {
 	rv->state = HH_NEGOTIATING_TLS;
 	rv->blocked = S2N_NOT_BLOCKED;
 	rv->ib_frame.remaining = 0;
+	rv->ib_frame.payload = NULL;
 	return rv;
 cleanup:
 	free(rv);
@@ -152,62 +153,97 @@ static int do_negotiate(struct client *client) {
 
 static int parse_frame(struct client *client, char *buf, size_t len) {
 #define advance(x) ({ bufp += (x); })
-#define read_u8() ({ advance(1); (uint8_t)bufp[-1]; })
-#define read_u16() ({ advance(2); ntohs(bufp[-2]); })
-#define read_u24() ({ advance(3); ntohs(bufp[-3]); })
-#define read_u32() ({ advance(4); ntohs(bufp[-4]); })
 #define remaining_len (len - (bufp - buf))
 	struct ib_frame *ib = &client->ib_frame;
 	char *bufp = buf;
 	while (1) {
-		switch (client->state) {
-			case HH_WAITING_MAGIC: {
-				// Parse client connection preface
+		if (client->state == HH_WAITING_MAGIC) {
+			// Parse client connection preface
+			size_t read_length = MIN(remaining_len, ib->remaining);
+			if (memcmp(CLIENT_MAGIC + CLIENT_MAGIC_LEN - ib->remaining,
+					bufp, read_length) != 0) {
+				log_warn("Invalid client connection preface");
+				return -1;
+			}
+			ib->remaining -= read_length;
+			advance(read_length);
+			if (ib->remaining == 0) {
+				log_debug("Parsed client connection preface");
+				change_state(client, HH_WAITING_SETTINGS);
+			} else
+				break;
+			ib->remaining = HH_HEADER_SIZE;
+			ib->state = HH_FRAME_HD;
+		}
+
+		switch (ib->state) {
+			case HH_FRAME_HD: {
+				// Store header in temporary buffer
 				size_t read_length = MIN(remaining_len, ib->remaining);
-				if (memcmp(CLIENT_MAGIC + CLIENT_MAGIC_LEN - ib->remaining,
-						bufp, read_length) != 0) {
-					log_warn("Invalid client connection preface");
-					return -1;
-				}
-				ib->remaining -= read_length;
-				advance(read_length);
-				if (ib->remaining == 0) {
-					log_debug("Parsed client connection preface");
-					change_state(client, HH_WAITING_SETTINGS);
-				}
-				ib->remaining = H2_HEADER_SIZE;
-				// Fallthrough
-				__attribute__((fallthrough));
-			} case HH_WAITING_SETTINGS: {
-				// Parse initial SETTINGS frame
-				// TODO: Unify into frame header parsing function
-				size_t read_length = MIN(remaining_len, ib->remaining);
+				if (read_length == 0)
+					break;
 				memcpy(ib->temp_buf, bufp, read_length);
 				advance(read_length);
 				ib->remaining -= read_length;
-				if (ib->remaining > 0)
+				if (ib->remaining > 0) // Can't do any more processing, wait for rest of header
 					break;
-
-				ib->header.length = ntohs((*(uint32_t *)ib->temp_buf) & 0xFFFFFF00);
-				ib->type = ib->temp_buf[3];
+				// Parse frame header
+				ib->header.length = ntohl((*(uint32_t *)ib->temp_buf) & 0xFFFFFF00) >> 8;
+				ib->header.type = ib->temp_buf[3];
 				ib->header.flags = ib->temp_buf[4];
-				ib->header.stream_id = ntohl(*(uint32_t*)(ib->temp_buf + 5) & 0x10000000);
+				ib->header.stream_id = ntohl(*(uint32_t*)(ib->temp_buf + 5) & 0x7FFFFFFF);
+				log_debug("Frame length %u, type %u, flags %u, s_id: %u",
+					ib->header.length, ib->header.type, ib->header.flags, ib->header.stream_id);
 
-				log_debug("Processed whole SETTINGS header");
-				log_debug("Length: %u, type: %u, flags: %u, s_id: %u",
-					ib->header.length, ib->type, ib->header.flags, ib->header.stream_id);
-				if (ib->type != HH_FT_SETTINGS || (ib->header.flags & HH_SETTINGS_ACK) != 0) {
-					// TODO: GOAWAY
-					return -1;	
-				} else
-					change_state(client, HH_IDLE);
+				// If we were waiting for the initial SETTINGS frame
+				if (client->state == HH_WAITING_SETTINGS) {
+					// It wasn't a settings frame
+					if (ib->header.type != HH_FT_SETTINGS || (ib->header.flags & HH_SETTINGS_ACK) != 0) {
+						// TODO: GOAWAY
+						return -1;	
+					} else {
+						change_state(client, HH_IDLE);
+					}
+				}
+				
+				// TODO: Check header length
+				free(ib->payload);
+				ib->payload = NULL;
+				if (ib->header.length > 0) {
+					ib->payload = malloc(ib->header.length);
+					ib->state = HH_FRAME_PAYLOAD;
+					ib->remaining = ib->header.length;
+				} else {
+					ib->remaining = HH_HEADER_SIZE;
+					break;
+				}
+				__attribute__((fallthrough));
+			} case HH_FRAME_PAYLOAD: {
+				// Read as much as we can into payload buffer
+				size_t read_length = MIN(remaining_len, ib->remaining);
+				if (read_length == 0)
+					break;
+				memcpy(ib->payload + (ib->header.length - ib->remaining), bufp, read_length);
+				advance(read_length);
+				ib->remaining -= read_length;
+				// We read the entire payload, now wait for a frame header again
+				if (ib->remaining == 0) {
+					ib->state = HH_FRAME_HD;
+					ib->remaining = HH_HEADER_SIZE;
+				}
 				break;
-			} default:
-				break;
+			}
 		}
 
-		switch (client->ib_frame.type) {
+		switch (ib->header.type) {
 			case HH_FT_SETTINGS:
+				log_debug("Received SETTINGS frame");
+				return 0;
+			case HH_FT_WINDOW_UPDATE:
+				log_debug("Received WINDOW_UPDATE frame");
+				return 0;
+			case HH_FT_HEADERS:
+				log_debug("Received HEADERS frame");
 				return 0;
 			default:
 				return 0;
@@ -219,7 +255,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 
 static int do_read(struct client *client) {
 	#define READ_LEN 4096
-	// TODO: Read in loop
 	char *recv_buffer = malloc(READ_LEN);
 	ssize_t nread;
 	int rv = 0;
@@ -244,7 +279,7 @@ static int do_read(struct client *client) {
 			rv = -1;
 			goto loop_end;
 		} else {
-			//write(1, recv_buffer, nread); // Debug log the data
+			//write(2, recv_buffer, nread); // Debug log the data
 			if (parse_frame(client, recv_buffer, (size_t)nread) < 0) {
 				rv = -1;
 				goto loop_end;
