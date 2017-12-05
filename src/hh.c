@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
+#include <sys/timerfd.h>
 #include <sys/epoll.h>
 #include <netdb.h>
 #include <signal.h>
@@ -26,10 +27,9 @@
 #define MAX_EVENTS 64
 #define MAX_FD_QUEUE 256
 #define WORKER_THREADS 3
-#define EVENT_CLIENT(ev) ((struct client *)(ev).data.ptr)
 
-static int fd_queue_head, fd_queue_tail, signal_fd;
-static int fd_queue[MAX_FD_QUEUE];
+static volatile int fd_queue_head, fd_queue_tail;
+static int signal_fd, fd_queue[MAX_FD_QUEUE];
 
 static pthread_mutex_t fd_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -141,18 +141,39 @@ static void consume_available_fd(int epoll_fd) {
 		fd_queue_tail = (fd_queue_tail + 1) % MAX_FD_QUEUE;
 		pthread_mutex_unlock(&fd_queue_lock);
 
-		// Add the FD to our epoll collection
-		struct epoll_event event;
-		event.data.ptr = client_new(new_fd);
-		// Might fail due to mlock limits
-		if (event.data.ptr == NULL) {
+		// Initialise per-client timer
+		int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+		if (timer_fd < 0) {
+			log_warn("Call to timerfd_create failed (%s)", strerror(errno));
 			close(new_fd);
 			return;
+		}	
 
+		// Add the FDs to our epoll collection
+		struct epoll_event event;
+		event.data.ptr = client_new(new_fd, timer_fd); // Might fail due to mlock limits
+		if (event.data.ptr == NULL) {
+			close(new_fd);
+			close(timer_fd);
+			return;
 		}
+
 		event.events = EPOLLRDHUP | EPOLLIN | EPOLLET;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
 			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
+			client_free(event.data.ptr);
+			return;
+		}
+
+		// Little hack: if bit 0 of ptr is set, timer event was fired.
+		// Otherwise an event was fired for the actual socket FD.
+		assert(((uintptr_t)event.data.ptr & 1) == 0);
+		event.data.ptr = (void *)((uintptr_t)event.data.ptr + 1);
+		event.events = EPOLLIN | EPOLLET;
+		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &event) == -1) {
+			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
+			client_free(event.data.ptr);
+			return;
 		}
 	} else
 		pthread_mutex_unlock(&fd_queue_lock);
@@ -218,13 +239,15 @@ static void *worker_event_loop(void *arg) {
 		if (n < 0 && errno == EINTR)
 			continue; // Need to recheck exit condition
 		for (i = 0; i < n; i++) {
-			struct client *client = EVENT_CLIENT(events[i]);
+			// If the last bit of the pointer is set, the timer and not the socket is ready to use
+			bool timer_expired = (uintptr_t)(events[i].data.ptr) & 1;
+			struct client *client = (struct client *)((uintptr_t)events[i].data.ptr & ~1);
 			if (events[i].events & EPOLLRDHUP) {
-				log_debug("Client disconnected via EPOLLRDHUP");
+				//log_debug("Client disconnected via EPOLLRDHUP");
 				close_client(client);
 				continue;
 			} else if (events[i].events & EPOLLHUP) {
-				log_debug("Client disconnected via EPOLLHUP");
+				//log_debug("Client disconnected via EPOLLHUP");
 				close_client(client);
 				continue;
 			} else if (events[i].events & EPOLLERR) {
@@ -237,6 +260,11 @@ static void *worker_event_loop(void *arg) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
 						consume_available_fd(epoll_fd);
+				} else if (timer_expired) {
+					if (client_on_timer_expired(client) < 0) {
+						close_client(client);
+					}
+					continue;
 				} else if (client->fd == signal_fd) {
 					should_exit = 1; // Maybe we should check which signal?
 				} else if (client_on_data_received(client) < 0) {
@@ -250,6 +278,8 @@ static void *worker_event_loop(void *arg) {
 			}
 		}
 	}
+
+	// TODO: Call s2n_cleanup here
 
 	free(events);
 	return NULL;
@@ -373,7 +403,7 @@ static int server_listen(int server_fd, unsigned short port) {
 
 		// Now we have one event, in &event
 		if (event.data.fd == signal_fd) {
-			break; // TODO: Handle
+			break; // TODO: Handle?
 		} else if (event.events & EPOLLRDHUP || event.events & EPOLLHUP || event.events & EPOLLERR || !(event.events & EPOLLIN)) {
 			log_fatal("Epoll event error (flags %d)", event.events);
 			break;

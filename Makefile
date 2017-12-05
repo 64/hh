@@ -4,7 +4,7 @@ SRC := src
 TEST := test
 EXE := hh
 
-CFLAGS += -Wall -Wextra -std=gnu11 -Iinclude -g -DWORKER_THREADS=3
+CFLAGS += -Wall -Wextra -std=gnu11 -Iinclude -DWORKER_THREADS=3
 LDLIBS += -ls2n -lcrypto -pthread
 
 SRCS := $(shell find $(SRC) -name "*.c")
@@ -15,7 +15,7 @@ DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 .PHONY: all clean run test valgrind rebuild cloc hexdump
 
 ifeq ($(HH_DEBUG),1)
-  CFLAGS += -O0 -DLOG_LEVEL=4 -fsanitize=address,undefined
+  CFLAGS += -O0 -g -DLOG_LEVEL=4 -fsanitize=address,undefined
 else
   CFLAGS += -O2 -DNDEBUG -DLOG_LEVEL=2
 endif
