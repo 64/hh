@@ -15,9 +15,9 @@ DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 .PHONY: all clean run test valgrind rebuild cloc hexdump
 
 ifeq ($(HH_DEBUG),1)
-  CFLAGS += -O0 -fsanitize=address,undefined
+  CFLAGS += -O0 -DLOG_LEVEL=4 -fsanitize=address,undefined
 else
-  CFLAGS += -O2 -DNDEBUG
+  CFLAGS += -O2 -DNDEBUG -DLOG_LEVEL=2
 endif
 
 all: $(BUILD)/$(EXE)
@@ -38,12 +38,12 @@ run: $(BUILD)/$(EXE)
 	@./$(BUILD)/$(EXE) 8000
 
 valgrind: $(BUILD)/$(EXE)
-	@valgrind ./$(BUILD)/$(EXE)
+	@valgrind --leak-check=full ./$(BUILD)/$(EXE)
 
 test: $(BUILD)/$(EXE)
-	@./$(BUILD)/$(EXE) > $(BUILD)/output.log &
+	@./$(BUILD)/$(EXE) &> $(BUILD)/output.log &
 	@sleep 0.3
-	@for TEST in $(TESTS); do python3 $$TEST; done
+	@for TEST in $(TESTS); do python $$TEST; done
 	@killall --signal SIGINT -w "$(EXE)"
 	@echo "----------- Server output -----------"
 	@cat $(BUILD)/output.log

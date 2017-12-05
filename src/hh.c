@@ -150,7 +150,7 @@ static void consume_available_fd(int epoll_fd) {
 			return;
 
 		}
-		event.events = EPOLLIN | EPOLLOUT | EPOLLET;
+		event.events = EPOLLRDHUP | EPOLLIN | EPOLLET;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
 			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
 		}
@@ -220,15 +220,19 @@ static void *worker_event_loop(void *arg) {
 		for (i = 0; i < n; i++) {
 			struct client *client = EVENT_CLIENT(events[i]);
 			if (events[i].events & EPOLLRDHUP) {
-				log_warn("Client disconnected via EPOLLRDHUP");
+				log_debug("Client disconnected via EPOLLRDHUP");
 				close_client(client);
+				continue;
 			} else if (events[i].events & EPOLLHUP) {
-				log_warn("Client disconnected via EPOLLHUP");
+				log_debug("Client disconnected via EPOLLHUP");
 				close_client(client);
+				continue;
 			} else if (events[i].events & EPOLLERR) {
 				log_warn("Epoll event error (flags %d)", events[i].events);
 				close_client(client);
-			} else if (events[i].events & EPOLLIN) {
+				continue;
+			} 
+			if (events[i].events & EPOLLIN) {
 				if (client->fd == event_fd) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
@@ -236,15 +240,13 @@ static void *worker_event_loop(void *arg) {
 				} else if (client->fd == signal_fd) {
 					should_exit = 1; // Maybe we should check which signal?
 				} else if (client_on_data_received(client) < 0) {
-					break;
+					continue;
 				}
-			} else if (events[i].events & EPOLLOUT) {
+			}
+			if (events[i].events & EPOLLOUT) {
 				if (client_on_write_ready(client) < 0) {
 					continue;
 				}
-			} else {
-				log_warn("Epoll event unknown (%d)", events[i].events);
-				continue;
 			}
 		}
 	}

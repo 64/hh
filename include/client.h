@@ -12,6 +12,7 @@ struct client {
 		HH_WAITING_MAGIC, // Waiting for client to send connection preface
 		HH_WAITING_SETTINGS, // Waiting for client to send initial SETTINGS frame
 		HH_TLS_SHUTDOWN, // Sent TLS alert, waiting for acknowledgement
+		HH_CLOSED, // Already closed (client disconnected)
 	} state;
 	s2n_blocked_status blocked;
 	struct ib_frame ib_frame;

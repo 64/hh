@@ -32,6 +32,7 @@ struct client *client_new(int fd) {
 	rv->blocked = S2N_NOT_BLOCKED;
 	rv->ib_frame.remaining = 0;
 	rv->ib_frame.payload = NULL;
+	memset(&rv->ib_frame.header, 0, sizeof rv->ib_frame.header);
 	return rv;
 cleanup:
 	free(rv);
@@ -39,10 +40,9 @@ cleanup:
 }
 
 void client_free(struct client *client) {
-	if (client != NULL) {
-		s2n_connection_free(client->tls); // TODO: Wipe the connection, don't free it
-		free(client);
-	}
+	s2n_connection_free(client->tls); // TODO: Wipe the connection, don't free it
+	free(client->ib_frame.payload);
+	free(client);
 }
 
 int close_client(struct client *client) {
@@ -90,6 +90,7 @@ static int change_state(struct client *client, enum client_state to) {
 			if (to == HH_TLS_SHUTDOWN)
 				break; // Treat this as a no-op for simplicity
 			__attribute__((fallthrough));
+		case HH_CLOSED:
 		verybad:
 		default:
 #ifdef NDEBUG
@@ -104,6 +105,7 @@ static int change_state(struct client *client, enum client_state to) {
 }
 
 // Initiates a graceful shutdown
+// Returns -1 when callers should call close_client
 static int send_shutdown(struct client *client) {
 	if (s2n_shutdown(client->tls, &client->blocked) < 0) {
 		switch(s2n_error_get_type(s2n_errno)) {
@@ -112,13 +114,12 @@ static int send_shutdown(struct client *client) {
 				return 0;
 			default:
 				log_warn("Call to s2n_shutdown failed (%s)", s2n_strerror(s2n_errno, "EN"));
-				close_client(client);
+				change_state(client, HH_CLOSED);
 				return -1;
 		}
 	}
 	// Graceful shutdown was successful, we can close now
-	close_client(client);
-	return 0;
+	return -1;
 }
 
 static int do_negotiate(struct client *client) {
@@ -128,7 +129,8 @@ static int do_negotiate(struct client *client) {
 	if (s2n_negotiate(client->tls, &client->blocked) < 0) {
 		switch (s2n_error_get_type(s2n_errno)) {
 			case S2N_ERR_T_CLOSED:
-				break;
+				change_state(client, HH_CLOSED);
+				return -1;
 			case S2N_ERR_T_BLOCKED:
 				break;
 			case S2N_ERR_T_ALERT:
@@ -162,13 +164,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 			size_t read_length = MIN(remaining_len, ib->remaining);
 			if (memcmp(CLIENT_MAGIC + CLIENT_MAGIC_LEN - ib->remaining,
 					bufp, read_length) != 0) {
-				log_warn("Invalid client connection preface");
+				log_debug("Invalid client connection preface");
 				return -1;
 			}
 			ib->remaining -= read_length;
 			advance(read_length);
 			if (ib->remaining == 0) {
-				log_debug("Parsed client connection preface");
 				change_state(client, HH_WAITING_SETTINGS);
 			} else
 				break;
@@ -192,8 +193,8 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				ib->header.type = ib->temp_buf[3];
 				ib->header.flags = ib->temp_buf[4];
 				ib->header.stream_id = ntohl(*(uint32_t*)(ib->temp_buf + 5) & 0x7FFFFFFF);
-				log_debug("Frame length %u, type %u, flags %u, s_id: %u",
-					ib->header.length, ib->header.type, ib->header.flags, ib->header.stream_id);
+				//log_debug("Frame length %u, type %u, flags %u, s_id: %u",
+				//	ib->header.length, ib->header.type, ib->header.flags, ib->header.stream_id);
 
 				// If we were waiting for the initial SETTINGS frame
 				if (client->state == HH_WAITING_SETTINGS) {
@@ -238,18 +239,25 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 		switch (ib->header.type) {
 			case HH_FT_SETTINGS:
 				log_debug("Received SETTINGS frame");
+				write(1, ib->payload, ib->header.length);
 				return 0;
 			case HH_FT_WINDOW_UPDATE:
 				log_debug("Received WINDOW_UPDATE frame");
+				write(1, ib->payload, ib->header.length);
 				return 0;
 			case HH_FT_HEADERS:
 				log_debug("Received HEADERS frame");
+				write(1, ib->payload, ib->header.length);
+				return 0;
+			case HH_FT_PING:
+				log_debug("Received PING frame");
+				write(1, ib->payload, ib->header.length);
 				return 0;
 			default:
 				return 0;
 		}
 	}
-	log_warn("Handle loop exit better please!");
+	log_trace();
 	return 0;
 }
 
@@ -262,6 +270,10 @@ static int do_read(struct client *client) {
 		s2n_errno = S2N_ERR_T_OK;
 		if ((nread = s2n_recv(client->tls, recv_buffer, READ_LEN, &client->blocked)) < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
+				case S2N_ERR_T_CLOSED:
+					change_state(client, HH_CLOSED);
+					rv = -1;
+					goto loop_end;
 				case S2N_ERR_T_BLOCKED:
 					break;
 				case S2N_ERR_T_IO:
@@ -270,7 +282,7 @@ static int do_read(struct client *client) {
 					rv = -1;
 					goto loop_end;
 				default:
-					fprintf(stderr, "s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
+					log_warn("s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
 					rv = -1;
 					goto loop_end;
 			}
@@ -317,7 +329,8 @@ int client_on_write_ready(struct client *client) {
 				goto error;
 			break;
 		case HH_TLS_SHUTDOWN:
-			send_shutdown(client);
+			if (send_shutdown(client) < 0)
+				goto error;
 			break;
 		default:
 #ifdef NDEBUG
@@ -353,7 +366,8 @@ int client_on_data_received(struct client *client) {
 				goto error;
 			break;
 		case HH_TLS_SHUTDOWN:
-			send_shutdown(client);
+			if (send_shutdown(client) < 0)
+				goto error;
 			break;
 		default:	
 #ifdef NDEBUG

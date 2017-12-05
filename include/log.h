@@ -13,7 +13,9 @@
 #define LOG_LEVEL_DEBUG 3
 #define LOG_LEVEL_TRACE 4
 
+#ifndef LOG_LEVEL
 #define LOG_LEVEL 4
+#endif
 
 #if LOG_LEVEL >= LOG_LEVEL_FATAL
 #define log_fatal(fmt, ...) fprintf(stderr, "[" RED "ERROR" COLOR_RST "] " fmt "\n",##__VA_ARGS__)

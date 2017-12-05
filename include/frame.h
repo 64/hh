@@ -6,6 +6,7 @@
 
 #define HH_FT_SETTINGS 4
 #define HH_FT_WINDOW_UPDATE 8
+#define HH_FT_PING 6
 #define HH_FT_HEADERS 1
 
 #define HH_SETTINGS_ACK 1
