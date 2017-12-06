@@ -22,7 +22,7 @@ def connect_h2():
 class TestConnect(unittest.TestCase):
     def test_connection_preface(self):
         sock = connect_tls()
-        sock.sendall(bytes("RRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "ascii"))
+        sock.sendall(bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", "ascii"))
         sock.close()
 
     def test_initial_settings(self):

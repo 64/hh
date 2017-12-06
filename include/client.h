@@ -1,7 +1,11 @@
 #pragma once
 #include <s2n.h>
+#include <stdbool.h>
 
 #include "frame.h"
+#include "buf_chain.h"
+
+#define CLIENT_EPOLL_EVENTS (EPOLLIN | EPOLLET | EPOLLRDHUP)
 
 struct client {
 	int fd; // This must be first, because of a little epoll hack we use
@@ -17,10 +21,12 @@ struct client {
 		HH_CLOSED, // Already closed (client disconnected)
 	} state;
 	s2n_blocked_status blocked;
+	bool is_write_blocked;
 	struct ib_frame ib_frame;
+	struct buf_chain *pending_writes;
 };
 
-struct client *client_new(int, int);
+struct client *client_new(int, int, int);
 void client_free(struct client *);
 int close_client(struct client *);
 

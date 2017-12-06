@@ -151,14 +151,14 @@ static void consume_available_fd(int epoll_fd) {
 
 		// Add the FDs to our epoll collection
 		struct epoll_event event;
-		event.data.ptr = client_new(new_fd, timer_fd); // Might fail due to mlock limits
+		event.data.ptr = client_new(new_fd, timer_fd, epoll_fd); // Might fail due to mlock limits
 		if (event.data.ptr == NULL) {
 			close(new_fd);
 			close(timer_fd);
 			return;
 		}
 
-		event.events = EPOLLRDHUP | EPOLLIN | EPOLLET;
+		event.events = CLIENT_EPOLL_EVENTS;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
 			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
 			client_free(event.data.ptr);
@@ -403,7 +403,7 @@ static int server_listen(int server_fd, unsigned short port) {
 
 		// Now we have one event, in &event
 		if (event.data.fd == signal_fd) {
-			break; // TODO: Handle?
+			break;
 		} else if (event.events & EPOLLRDHUP || event.events & EPOLLHUP || event.events & EPOLLERR || !(event.events & EPOLLIN)) {
 			log_fatal("Epoll event error (flags %d)", event.events);
 			break;

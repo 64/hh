@@ -5,11 +5,13 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/timerfd.h>
+#include <sys/epoll.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <assert.h>
 
 #include "client.h"
+#include "buf_chain.h"
 #include "log.h"
 #include "util.h"
 
@@ -18,7 +20,12 @@
 
 extern struct s2n_config *server_config;
 
-struct client *client_new(int fd, int timer_fd) {
+_Thread_local int epoll_fd = -1;
+
+static int queue_write_data(struct client *, char *, size_t);
+
+struct client *client_new(int fd, int timer_fd, int efd) {
+	epoll_fd = efd;
 	struct client *rv = malloc(sizeof(struct client));
 	rv->tls = s2n_connection_new(S2N_SERVER);
 	if (rv->tls == NULL) {
@@ -27,11 +34,13 @@ struct client *client_new(int fd, int timer_fd) {
 	}
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
-	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING); // TODO: Implement blinding
+	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
 	s2n_connection_set_ctx(rv->tls, rv);
+	rv->pending_writes = NULL;
 	rv->fd = fd;
 	rv->timer_fd = timer_fd;
 	rv->state = HH_NEGOTIATING_TLS;
+	rv->is_write_blocked = false;
 	rv->blocked = S2N_NOT_BLOCKED;
 	rv->ib_frame.remaining = 0;
 	rv->ib_frame.payload = NULL;
@@ -46,6 +55,7 @@ void client_free(struct client *client) {
 	// TODO: Wipe the connection, don't free it
 	s2n_connection_wipe(client->tls);
 	s2n_connection_free(client->tls);
+	buf_free_chain(client->pending_writes);
 	free(client->ib_frame.payload);
 	free(client);
 }
@@ -94,6 +104,8 @@ static int change_state(struct client *client, enum client_state to) {
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
 				case HH_CLOSED:
+					client->state = to;
+					break;
 				case HH_IDLE:
 					client->state = to;
 					break;
@@ -154,6 +166,7 @@ static int send_shutdown(struct client *client) {
 		}
 	}
 	// Graceful shutdown was successful, we can close now
+	log_debug("Graceful shutdown");
 	return -1;
 }
 
@@ -195,7 +208,6 @@ static int do_negotiate(struct client *client) {
 	if (s2n_negotiate(client->tls, &client->blocked) < 0) {
 		switch (s2n_error_get_type(s2n_errno)) {
 			case S2N_ERR_T_CLOSED:
-				change_state(client, HH_CLOSED);
 				return -1;
 			case S2N_ERR_T_BLOCKED:
 				break;
@@ -320,10 +332,8 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				//write(1, ib->payload, ib->header.length);
 				return 0;
 			case HH_FT_PING:
-				/*if (has_full_frame) {
-					log_debug("Received PING frame");
-					write(1, ib->payload, ib->header.length);
-				}*/
+				if (has_full_frame)
+					queue_write_data(client, ib->payload, ib->header.length);
 				return 0;
 			default:
 				return 0;
@@ -343,7 +353,6 @@ static int do_read(struct client *client) {
 		if ((nread = s2n_recv(client->tls, recv_buffer, READ_LEN, &client->blocked)) < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
 				case S2N_ERR_T_CLOSED:
-					change_state(client, HH_CLOSED);
 					rv = -1;
 					goto loop_end;
 				case S2N_ERR_T_BLOCKED:
@@ -373,8 +382,100 @@ loop_end:
 	return rv;
 }
 
+static int signal_epollout(struct client *client, bool on) {
+	struct epoll_event ev;
+	ev.data.ptr = client;
+	ev.events = CLIENT_EPOLL_EVENTS;
+	if (on)	ev.events |= EPOLLOUT;
+	if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) < 0)
+		return -1;
+	return 0;
+}
+
 static int do_write(struct client *client) {
-	(void)client;
+	do {
+		// Ensure we still have data to write
+		if (client->pending_writes == NULL)
+			return 0;
+
+		ssize_t nwritten;
+		s2n_errno = S2N_ERR_T_OK;
+		ssize_t write_len = client->pending_writes->len - client->pending_writes->offset;
+		char *buf_start = client->pending_writes->data + client->pending_writes->offset;
+		write(2, buf_start, write_len);
+		nwritten = s2n_send(client->tls, buf_start, write_len, &client->blocked);
+		if (nwritten < 0) {
+			switch (s2n_error_get_type(s2n_errno)) {
+				case S2N_ERR_T_CLOSED:
+					return -1;
+				case S2N_ERR_T_BLOCKED:
+					break;
+				case S2N_ERR_T_IO:
+					return blind_client(client, s2n_connection_get_delay(client->tls));
+				default:
+					log_warn("s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
+					return blind_client(client, s2n_connection_get_delay(client->tls));
+			}
+		} else {
+			// We stil have data to write
+			if (nwritten < write_len) {
+				client->pending_writes->offset += nwritten;
+			} else {
+				// Else we have exhausted all the data in this buffer
+				struct buf_chain *buf = buf_pop_chain(client);
+				free(buf);
+			}
+		}
+	} while (client->blocked == S2N_NOT_BLOCKED);
+
+	// We still have data remaining, signal EPOLLOUT
+	if (client->pending_writes != NULL && !client->is_write_blocked) {
+		client->is_write_blocked = true;
+		if (signal_epollout(client, true) < 0)
+			return -1;
+	} else if (client->pending_writes == NULL && client->is_write_blocked) {
+		// All data is now written, clear EPOLLOUT
+		client->is_write_blocked = false;
+		if (signal_epollout(client, false) < 0)
+			return -1;
+	}
+
+	return 0;
+}
+
+static int queue_write_data(struct client *client, char *data, size_t len) {
+	struct buf_chain *last;
+	if (client->pending_writes == NULL) {
+		client->pending_writes = buf_alloc();
+		last = client->pending_writes;
+	} else
+		// TODO: Make O(1)
+		for (last = client->pending_writes; last->next != NULL; last = last->next)
+			;
+	
+	if (last->len < BUF_SIZE) {
+		size_t write_size = MIN(BUF_SIZE - last->len, len);
+		memcpy(last->data + last->len, data, write_size);
+		last->len += write_size;
+		data += write_size;
+		len -= write_size;
+	}
+
+	// Now buffer is either filled or we have written all the data
+	while (len > 0) {
+		struct buf_chain *buf = buf_alloc();
+		size_t write_size = MIN(BUF_SIZE, len);
+		memcpy(buf->data, data, write_size);
+		data += write_size;
+		len -= write_size;
+		buf->len = write_size;
+		last->next = buf;
+		last = buf;
+	}
+
+	// If we can write it now, do it
+	if (!client->is_write_blocked)
+		return do_write(client);
 	return 0;
 }
 
@@ -389,10 +490,12 @@ int client_on_write_ready(struct client *client) {
 				change_state(client, HH_WAITING_MAGIC);
 			break;
 		case HH_WAITING_MAGIC:
-			// TODO: Work out what to do here
+			log_trace(); // This shouldn't happen
 			break;
 		case HH_WAITING_SETTINGS:
 			// Keep sending SETTINGS frame
+			if (do_write(client) < 0)
+				goto graceful_exit;
 			break;
 		case HH_IDLE:
 			if (do_write(client) < 0)
