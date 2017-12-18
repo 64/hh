@@ -4,4 +4,6 @@ HTTP/2 server written in C.
 
 Requires GCC with C11 capabilities.
 
-Currently only works on Linux due to use of epoll.
+Also requires the [cashpack](https://github.com/Dridi/cashpack/) library to be installed.
+
+Currently only works on Linux due to unrepentant use of epoll.

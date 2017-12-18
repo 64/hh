@@ -1,24 +1,20 @@
 BUILD := build
 INCLUDE := include
 SRC := src
-HPACK := hpack
 TEST := test
 EXE := hh
-HPACKER := hpacker
 
 CFLAGS += -Wall -Wextra -std=gnu11 -Iinclude -DWORKER_THREADS=3
 HPACKER_CFLAGS += -Wall -Wextra -std=c99
-LDLIBS += -ls2n -lcrypto -pthread
+LDLIBS += -ls2n -lcrypto -pthread -l:libhpack.a
 HPACKER_LDLIBS += -pthread
 
-HPACK_SRCS := $(shell find $(HPACK) -name "*.c")
-SRCS := $(shell find $(SRC) -name "*.c") $(filter-out $(HPACK)/hpacker.c,$(HPACK_SRCS))
-HPACK_OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(HPACK_SRCS))))
+SRCS := $(shell find $(SRC) -name "*.c")
 OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
 TESTS := $(shell find $(TEST) -name "test_*.py")
 DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 
-.PHONY: all clean run test test_hpack valgrind rebuild cloc hexdump hpacker
+.PHONY: all clean run test valgrind rebuild cloc hexdump
 
 ifeq ($(HH_DEBUG),1)
   CFLAGS += -O0 -g -DLOG_LEVEL=4 -fsanitize=address,undefined
@@ -48,7 +44,6 @@ run: $(BUILD)/$(EXE)
 valgrind: $(BUILD)/$(EXE)
 	@valgrind --leak-check=full ./$(BUILD)/$(EXE)
 
-hpacker: $(BUILD) $(BUILD)/$(HPACKER)
 
 test: $(BUILD)/$(EXE)
 	@./$(BUILD)/$(EXE) &> $(BUILD)/output.log &
@@ -57,9 +52,6 @@ test: $(BUILD)/$(EXE)
 	@killall --signal SIGINT -w "$(EXE)"
 	@echo "----------- Server output -----------"
 	@cat $(BUILD)/output.log
-
-test_hpack: $(BUILD)/$(HPACKER)
-	@python $(TEST)/test_hpack.py
 
 $(BUILD)/$(EXE): $(BUILD) $(OBJS)
 	$(CC) $(CFLAGS) $(OBJS) -o $@ -L$(BUILD) $(LDLIBS)

@@ -22,7 +22,14 @@ extern struct s2n_config *server_config;
 
 _Thread_local int epoll_fd = -1;
 
-static int queue_write_data(struct client *, char *, size_t);
+struct h2_settings default_settings = {
+	.header_table_size = 4096,
+	.enable_push = 1,
+	.max_concurrent_streams = 1,
+	.initial_window_size = 65535,
+	.max_frame_size = 16384,
+	.max_header_list_size = 0xFFFFFFFF
+};
 
 struct client *client_new(int fd, int timer_fd, int efd) {
 	epoll_fd = efd;
@@ -44,6 +51,8 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	rv->blocked = S2N_NOT_BLOCKED;
 	rv->ib_frame.remaining = 0;
 	rv->ib_frame.payload = NULL;
+	rv->decoder = hpack_decoder(default_settings.header_table_size, -1, hpack_default_alloc);
+	memcpy(&rv->settings, &default_settings, sizeof default_settings);
 	memset(&rv->ib_frame.header, 0, sizeof rv->ib_frame.header);
 	return rv;
 cleanup:
@@ -56,6 +65,7 @@ void client_free(struct client *client) {
 	s2n_connection_wipe(client->tls);
 	s2n_connection_free(client->tls);
 	buf_free_chain(client->pending_writes);
+	hpack_free(&client->decoder);
 	free(client->ib_frame.payload);
 	free(client);
 }
@@ -118,7 +128,7 @@ static int change_state(struct client *client, enum client_state to) {
 				case HH_WAITING_MAGIC:
 					client->state = to;
 					client->ib_frame.remaining = CLIENT_MAGIC_LEN;
-					// Send server SETTINGS frame
+					send_settings(client, NULL, false); // Server connection preface
 					break;
 				case HH_CLOSED:
 					client->state = to;
@@ -231,6 +241,20 @@ static int do_negotiate(struct client *client) {
 	return 0;
 }
 
+static void hpack_decode_event(enum hpack_event_e evt, const char *buf, size_t size, void *priv) {
+	(void)size; (void)priv;
+	switch (evt) {
+		case HPACK_EVT_VALUE:
+			printf(": %s\n", buf);
+			break;
+		case HPACK_EVT_NAME:
+			printf("%s", buf);
+			break;
+		default:
+			break;
+	}
+}
+
 static int parse_frame(struct client *client, char *buf, size_t len) {
 #define advance(x) ({ bufp += (x); })
 #define remaining_len (len - (bufp - buf))
@@ -272,16 +296,19 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					return 0;
 					
 				// Parse frame header
-				ib->header.length = ntohl((*(uint32_t *)ib->temp_buf) & 0xFFFFFF00) >> 8;
+				uint32_t tmp;
 				ib->header.type = ib->temp_buf[3];
 				ib->header.flags = ib->temp_buf[4];
-				ib->header.stream_id = ntohl(*(uint32_t*)(ib->temp_buf + 5) & 0x7FFFFFFF);
+				memcpy(&tmp, ib->temp_buf + 5, sizeof(uint32_t));
+				ib->header.stream_id = ntohl(tmp & 0x7FFFFFFF);
+				memcpy(&tmp, ib->temp_buf, sizeof(uint32_t));
+				ib->header.length = ntohl(tmp & 0xFFFFFF00) >> 8;
 
 				// If we were waiting for the initial SETTINGS frame
 				if (client->state == HH_WAITING_SETTINGS) {
 					// It wasn't a settings frame
 					if (ib->header.type != HH_FT_SETTINGS || (ib->header.flags & HH_SETTINGS_ACK) != 0) {
-						// TODO: GOAWAY
+						send_goaway(client, HH_ERR_PROTOCOL);
 						return -1;	
 					} else {
 						change_state(client, HH_IDLE);
@@ -320,23 +347,113 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 
 		switch (ib->header.type) {
 			case HH_FT_SETTINGS:
-				//log_debug("Received SETTINGS frame");
-				//write(1, ib->payload, ib->header.length);
-				return 0;
+				if (!has_full_frame)
+					continue;
+				log_debug("Received SETTINGS frame");
+				// Parse settings frame
+				if (ib->header.stream_id != 0 || ib->header.length % 6 != 0) {
+					send_goaway(client, ib->header.stream_id != 0 ? HH_ERR_PROTOCOL : HH_ERR_FRAME_SIZE);
+					return -1;
+				} else if ((ib->header.flags & HH_SETTINGS_ACK) != 0) {
+					if (ib->header.length != 0) {
+						send_goaway(client, HH_ERR_FRAME_SIZE);
+						return -1;
+					}
+				} else {
+					size_t read = 0;
+					while (read < ib->header.length) {
+						uint16_t id;
+						uint32_t value;
+						memcpy(&id, &ib->payload[read], sizeof(uint16_t));
+						memcpy(&value, &ib->payload[read + 2], sizeof(uint32_t));
+						id = ntohs(id);
+						value = ntohl(value);
+						read += 6;
+						switch (id) {
+							case 1:
+								client->settings.header_table_size = value;
+								break;
+							case 2:
+								if (value != 0 && value != 1) {
+									send_goaway(client, HH_ERR_PROTOCOL);
+									return -1;
+								}
+								client->settings.enable_push = value;
+								break;
+							case 3:
+								client->settings.max_concurrent_streams = value;
+								break;
+							case 4:
+								if (value > ((1U << 31) - 1)) {
+									send_goaway(client, HH_ERR_FLOW_CONTROL);
+									return -1;
+								}
+								client->settings.initial_window_size = value;
+								break;
+							case 5:
+								if (value < (1 << 16) || value > ((1 << 24) - 1)) {
+									send_goaway(client, HH_ERR_PROTOCOL);
+									return -1;
+								}
+								client->settings.max_frame_size = value;
+								break;
+							case 6:
+								client->settings.max_header_list_size = value;
+								break;
+							default:
+								// Don't error, just ignore
+								break;
+						}
+						log_debug("Received setting %d, value %#x", id, value);
+					}
+					// ACKnowledge
+					send_settings(client, NULL, true);
+				}
+				break;
 			case HH_FT_WINDOW_UPDATE:
 				//log_debug("Received WINDOW_UPDATE frame");
 				//write(1, ib->payload, ib->header.length);
-				return 0;
+				break;
 			case HH_FT_HEADERS:
-				//log_debug("Received HEADERS frame");
-				//write(1, ib->payload, ib->header.length);
-				return 0;
+				if (!has_full_frame)
+					continue;
+				log_debug("Received HEADERS frame");
+				char buf[1024];
+				struct hpack_decoding dec = {
+					.blk = ib->payload,
+					.blk_len = ib->header.length,
+					.buf = buf,
+					.buf_len = sizeof buf,
+					.cb = hpack_decode_event,
+					.priv = client
+				};
+				if (ib->header.flags & HH_PADDED) {
+					uint8_t pad_len = *(uint8_t *)ib->payload;
+					dec.blk_len -= pad_len + 1; // 1 for pad_length
+					dec.blk += 1;
+				}
+				if (ib->header.flags & HH_PRIORITY) {
+					// TODO: Parse stream dependency, exclusive, weight
+					dec.blk_len -= 5;
+					dec.blk += 5;
+				}
+				if (hpack_decode(client->decoder, &dec) < 0) {
+					log_warn("HPACK decoding error");
+					return -1;
+				}
+				break;
 			case HH_FT_PING:
 				if (has_full_frame)
-					queue_write_data(client, ib->payload, ib->header.length);
-				return 0;
+					client_queue_write(client, ib->payload, ib->header.length);
+				break;
+			case HH_FT_GOAWAY:
+				if (!has_full_frame)
+					continue;
+				log_info("Received GOAWAY with code %u", htonl(*(uint32_t *)&ib->payload[4]));
+				return -1;
+				break;
 			default:
-				return 0;
+				break;
 		}
 	}
 	log_trace();
@@ -402,7 +519,6 @@ static int do_write(struct client *client) {
 		s2n_errno = S2N_ERR_T_OK;
 		ssize_t write_len = client->pending_writes->len - client->pending_writes->offset;
 		char *buf_start = client->pending_writes->data + client->pending_writes->offset;
-		write(2, buf_start, write_len);
 		nwritten = s2n_send(client->tls, buf_start, write_len, &client->blocked);
 		if (nwritten < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
@@ -443,7 +559,7 @@ static int do_write(struct client *client) {
 	return 0;
 }
 
-static int queue_write_data(struct client *client, char *data, size_t len) {
+int client_queue_write(struct client *client, char *data, size_t len) {
 	struct buf_chain *last;
 	if (client->pending_writes == NULL) {
 		client->pending_writes = buf_alloc();

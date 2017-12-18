@@ -1,15 +1,35 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define HH_HEADER_SIZE 9
 
-#define HH_FT_SETTINGS 4
-#define HH_FT_WINDOW_UPDATE 8
-#define HH_FT_PING 6
 #define HH_FT_HEADERS 1
+#define HH_FT_SETTINGS 4
+#define HH_FT_PING 6
+#define HH_FT_GOAWAY 7
+#define HH_FT_WINDOW_UPDATE 8
 
 #define HH_SETTINGS_ACK 1
+#define HH_HEADERS_END_STREAM 1
+#define HH_HEADERS_END_HEADERS 2
+#define HH_PADDED 8
+#define HH_PRIORITY 32
+
+#define HH_ERR_NONE 0
+#define HH_ERR_PROTOCOL 1
+#define HH_ERR_INTERNAL 2
+#define HH_ERR_FLOW_CONTROL 3
+#define HH_ERR_SETTINGS_TIMEOUT 4
+#define HH_ERR_STREAM_CLOSED 5
+#define HH_ERR_FRAME_SIZE 6
+#define HH_ERR_REFUSED_STREAM 7
+#define HH_ERR_CANCEL 8
+#define HH_ERR_COMPRESSION 9
+#define HH_ERR_CONNECT 10
+#define HH_ERR_EHNANCE_YOUR_CALM 11 /* c|:^) */
+#define HH_ERR_INADEQUATE_SECURITY 12
 
 struct h2_frame_hd {
 	uint32_t length; // 24 bits
@@ -29,3 +49,8 @@ struct ib_frame {
 	} state;
 };
 
+struct client;
+struct h2_settings;
+
+int send_goaway(struct client *, uint32_t);
+int send_settings(struct client *client, struct h2_settings *server_settings, bool ack);
