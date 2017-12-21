@@ -147,7 +147,7 @@ static void consume_available_fd(int epoll_fd) {
 			log_warn("Call to timerfd_create failed (%s)", strerror(errno));
 			close(new_fd);
 			return;
-		}	
+		}
 
 		// Add the FDs to our epoll collection
 		struct epoll_event event;
@@ -215,7 +215,7 @@ static void *worker_event_loop(void *arg) {
 	struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
 
 	int event_fd = *(int *)arg; // Points to the eventfd - works since FD is first in struct
-	events[0].data.ptr = &event_fd; 
+	events[0].data.ptr = &event_fd;
 	events[0].events = EPOLLIN | EPOLLET;
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &events[0]) == -1) {
 		log_fatal("Call to epoll_ctl failed (%s)", strerror(errno));
@@ -243,19 +243,24 @@ static void *worker_event_loop(void *arg) {
 			bool timer_expired = (uintptr_t)(events[i].data.ptr) & 1;
 			struct client *client = (struct client *)((uintptr_t)events[i].data.ptr & ~1);
 			if (events[i].events & EPOLLRDHUP) {
-				//log_debug("Client disconnected via EPOLLRDHUP");
 				close_client(client);
 				continue;
 			} else if (events[i].events & EPOLLHUP) {
-				//log_debug("Client disconnected via EPOLLHUP");
 				close_client(client);
 				continue;
 			} else if (events[i].events & EPOLLERR) {
-				log_warn("Epoll event error (flags %d)", events[i].events);
+				if (!timer_expired && client->fd != event_fd && client->fd != signal_fd) {
+					int error = 0;
+					socklen_t errlen = sizeof(error);
+					if (getsockopt(client->fd, SOL_SOCKET, SO_ERROR, (void *)&error, &errlen) == 0) {
+						log_warn("Epoll event error (%s: flags %d)", strerror(error), events[i].events);
+					} else
+						log_warn("Epoll event error on socket (flags %d)", events[i].events);
+				} else
+					log_warn("Epoll event error (flags %d)", events[i].events);
 				close_client(client);
 				continue;
-			} 
-			if (events[i].events & EPOLLIN) {
+			} else if (events[i].events & EPOLLIN) {
 				if (client->fd == event_fd) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
@@ -321,7 +326,7 @@ static int server_init(unsigned short port) {
 		}
 
 		break;
-	}	
+	}
 
 	freeaddrinfo(servinfo);
 
@@ -340,7 +345,7 @@ static int server_init(unsigned short port) {
 		log_fatal("Failed to load server certificate and private key file");
 		return -1;
 	}
-	
+
 	return server_fd;
 }
 
@@ -378,7 +383,7 @@ static int server_listen(int server_fd, unsigned short port) {
 	}
 
 	log_info("Server waiting for connections on localhost:%hu...", port);
-	
+
 	// Start worker threads
 	pthread_t worker_threads[WORKER_THREADS];
 	for (size_t i = 0; i < WORKER_THREADS; i++) {

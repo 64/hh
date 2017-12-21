@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
 
 #define HH_HEADER_SIZE 9
@@ -12,6 +13,7 @@
 #define HH_FT_WINDOW_UPDATE 8
 
 #define HH_SETTINGS_ACK 1
+#define HH_PING_ACK 1
 #define HH_HEADERS_END_STREAM 1
 #define HH_HEADERS_END_HEADERS 2
 #define HH_PADDED 8
@@ -53,4 +55,5 @@ struct client;
 struct h2_settings;
 
 int send_goaway(struct client *, uint32_t);
+int send_ping(struct client *client, uint8_t *data, bool ack);
 int send_settings(struct client *client, struct h2_settings *server_settings, bool ack);

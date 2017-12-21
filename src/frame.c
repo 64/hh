@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <stdint.h>
+#include <string.h>
 #include <assert.h>
 
 #include "frame.h"
@@ -24,6 +25,11 @@ struct frame_settings {
 	} __attribute__((packed)) fields[];
 } __attribute__((packed));
 
+struct frame_ping {
+	struct frame_header header;
+	uint8_t data[8];
+} __attribute__((packed));
+
 static void construct_frame_header(struct frame_header *hd, uint32_t length, uint8_t flags, uint8_t type, uint32_t stream_id) {
 	hd->data[2] = length & 0xFF;
 	hd->data[1] = (length >> 9) & 0xFF;
@@ -43,7 +49,16 @@ int send_goaway(struct client *client, uint32_t err_code) {
 	// TODO: else ...
 	goaway.err_code = htonl(err_code);
 	construct_frame_header(&goaway.header, 8, 0, HH_FT_GOAWAY, 0);
-	client_queue_write(client, (char *)&goaway, sizeof goaway);
+	client_queue_write(client, HH_PRI_HIGH, (char *)&goaway, sizeof goaway);
+	return 0;
+}
+
+// Data must be 8 bytes long
+int send_ping(struct client *client, uint8_t *data, bool ack) {
+	struct frame_ping ping = { 0 };
+	memcpy(ping.data, data, 8);
+	construct_frame_header(&ping.header, 8, ack, HH_FT_PING, 0);
+	client_queue_write(client, HH_PRI_HIGH, (char *)&ping, sizeof ping);
 	return 0;
 }
 
@@ -53,6 +68,6 @@ int send_settings(struct client *client, struct h2_settings *server_settings, bo
 	struct frame_settings settings = { 0 };
 	assert(server_settings == NULL);
 	construct_frame_header(&settings.header, 0, ack, HH_FT_SETTINGS, 0);
-	client_queue_write(client, (char *)&settings, sizeof settings);
+	client_queue_write(client, HH_PRI_MED, (char *)&settings, sizeof settings);
 	return 0;
 }

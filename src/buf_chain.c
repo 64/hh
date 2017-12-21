@@ -21,10 +21,10 @@ void buf_free_chain(struct buf_chain *chain) {
 	}
 }
 
-struct buf_chain *buf_pop_chain(struct client *client) {
-	if (client->pending_writes == NULL)
+struct buf_chain *buf_pop_chain(struct buf_chain **chain) {
+	if (chain == NULL)
 		return NULL;
-	struct buf_chain *rv = client->pending_writes;
-	client->pending_writes = client->pending_writes->next;
+	struct buf_chain *rv = *chain;
+	*chain = (*chain)->next;
 	return rv;
 }

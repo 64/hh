@@ -43,7 +43,9 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	s2n_connection_set_config(rv->tls, server_config);
 	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
 	s2n_connection_set_ctx(rv->tls, rv);
-	rv->pending_writes = NULL;
+	rv->low_pri_writes = NULL;
+	rv->med_pri_writes = NULL;
+	rv->high_pri_writes = NULL;
 	rv->fd = fd;
 	rv->timer_fd = timer_fd;
 	rv->state = HH_NEGOTIATING_TLS;
@@ -64,7 +66,9 @@ void client_free(struct client *client) {
 	// TODO: Wipe the connection, don't free it
 	s2n_connection_wipe(client->tls);
 	s2n_connection_free(client->tls);
-	buf_free_chain(client->pending_writes);
+	buf_free_chain(client->low_pri_writes);
+	buf_free_chain(client->med_pri_writes);
+	buf_free_chain(client->high_pri_writes);
 	hpack_free(&client->decoder);
 	free(client->ib_frame.payload);
 	free(client);
@@ -93,6 +97,7 @@ static int change_state(struct client *client, enum client_state to) {
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
 				case HH_CLOSED:
+				case HH_GOAWAY:
 					client->state = to;
 					break;
 				default:
@@ -114,8 +119,7 @@ static int change_state(struct client *client, enum client_state to) {
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
 				case HH_CLOSED:
-					client->state = to;
-					break;
+				case HH_GOAWAY:
 				case HH_IDLE:
 					client->state = to;
 					break;
@@ -132,6 +136,16 @@ static int change_state(struct client *client, enum client_state to) {
 					break;
 				case HH_CLOSED:
 					client->state = to;
+					break;
+				default:
+					goto verybad;
+			}
+			break;
+		case HH_GOAWAY:
+			switch (to) {
+				case HH_TLS_SHUTDOWN:
+				case HH_GOAWAY:
+				case HH_CLOSED:
 					break;
 				default:
 					goto verybad;
@@ -176,7 +190,16 @@ static int send_shutdown(struct client *client) {
 		}
 	}
 	// Graceful shutdown was successful, we can close now
-	log_debug("Graceful shutdown");
+	return -1;
+}
+
+// Returns -1 when goaway has been sent
+static int wait_goaway(struct client *client) {
+	change_state(client, HH_GOAWAY);
+	// If there's anything left in the high priority write queue, don't change state yet
+	if (client->high_pri_writes != NULL)
+		return 0;
+	// We can go to TLS shutdown now
 	return -1;
 }
 
@@ -184,7 +207,7 @@ static int blind_client(struct client *client, uint64_t ns) {
 	time_t seconds = ns / 1000000000;
 	long nanos = ns % 1000000000;
 	struct itimerspec expiry_time = {
-		{ 0, 0 }, // Interval time	
+		{ 0, 0 }, // Interval time
 		{ seconds, nanos }, // Expiry time
 	};
 	if (ns == 0)
@@ -230,7 +253,7 @@ static int do_negotiate(struct client *client) {
 			case S2N_ERR_T_IO:
 				// I suppose if ALPN fails, then negotiate will return an error even when successful
 				// Skip printing a warning if this happens, but still close the connection.
-				if (errno != 0)	
+				if (errno != 0)
 					log_warn("Call to s2n_negotiate returned IO error");
 				return blind_client(client, s2n_connection_get_delay(client->tls));
 			default:
@@ -242,13 +265,13 @@ static int do_negotiate(struct client *client) {
 }
 
 static void hpack_decode_event(enum hpack_event_e evt, const char *buf, size_t size, void *priv) {
-	(void)size; (void)priv;
+	(void)size; (void)priv; (void)buf;
 	switch (evt) {
 		case HPACK_EVT_VALUE:
-			printf(": %s\n", buf);
+			//printf(": %s\n", buf);
 			break;
 		case HPACK_EVT_NAME:
-			printf("%s", buf);
+			//printf("%s", buf);
 			break;
 		default:
 			break;
@@ -260,7 +283,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 #define remaining_len (len - (bufp - buf))
 	struct ib_frame *ib = &client->ib_frame;
 	char *bufp = buf;
-	
+
 	// Parse client connection preface
 	if (client->state == HH_WAITING_MAGIC) {
 		size_t read_length = MIN(remaining_len, ib->remaining);
@@ -294,7 +317,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				ib->remaining -= read_length;
 				if (ib->remaining > 0) // Can't do any more processing, wait for rest of header
 					return 0;
-					
+
 				// Parse frame header
 				uint32_t tmp;
 				ib->header.type = ib->temp_buf[3];
@@ -309,12 +332,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					// It wasn't a settings frame
 					if (ib->header.type != HH_FT_SETTINGS || (ib->header.flags & HH_SETTINGS_ACK) != 0) {
 						send_goaway(client, HH_ERR_PROTOCOL);
-						return -1;	
+						goto goaway;
 					} else {
 						change_state(client, HH_IDLE);
 					}
 				}
-				
+
 				// TODO: Check header length
 				free(ib->payload);
 				ib->payload = NULL;
@@ -349,15 +372,14 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 			case HH_FT_SETTINGS:
 				if (!has_full_frame)
 					continue;
-				log_debug("Received SETTINGS frame");
 				// Parse settings frame
 				if (ib->header.stream_id != 0 || ib->header.length % 6 != 0) {
 					send_goaway(client, ib->header.stream_id != 0 ? HH_ERR_PROTOCOL : HH_ERR_FRAME_SIZE);
-					return -1;
+					goto goaway;
 				} else if ((ib->header.flags & HH_SETTINGS_ACK) != 0) {
 					if (ib->header.length != 0) {
 						send_goaway(client, HH_ERR_FRAME_SIZE);
-						return -1;
+						goto goaway;
 					}
 				} else {
 					size_t read = 0;
@@ -376,7 +398,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 							case 2:
 								if (value != 0 && value != 1) {
 									send_goaway(client, HH_ERR_PROTOCOL);
-									return -1;
+									goto goaway;
 								}
 								client->settings.enable_push = value;
 								break;
@@ -386,14 +408,14 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 							case 4:
 								if (value > ((1U << 31) - 1)) {
 									send_goaway(client, HH_ERR_FLOW_CONTROL);
-									return -1;
+									goto goaway;
 								}
 								client->settings.initial_window_size = value;
 								break;
 							case 5:
 								if (value < (1 << 16) || value > ((1 << 24) - 1)) {
 									send_goaway(client, HH_ERR_PROTOCOL);
-									return -1;
+									goto goaway;
 								}
 								client->settings.max_frame_size = value;
 								break;
@@ -404,7 +426,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 								// Don't error, just ignore
 								break;
 						}
-						log_debug("Received setting %d, value %#x", id, value);
+						//log_debug("Received setting %d, value %#x", id, value);
 					}
 					// ACKnowledge
 					send_settings(client, NULL, true);
@@ -417,7 +439,10 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 			case HH_FT_HEADERS:
 				if (!has_full_frame)
 					continue;
-				log_debug("Received HEADERS frame");
+				if (ib->header.stream_id == 0) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				}
 				char buf[1024];
 				struct hpack_decoding dec = {
 					.blk = ib->payload,
@@ -429,27 +454,47 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				};
 				if (ib->header.flags & HH_PADDED) {
 					uint8_t pad_len = *(uint8_t *)ib->payload;
+					if (pad_len >= ib->header.length) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
 					dec.blk_len -= pad_len + 1; // 1 for pad_length
 					dec.blk += 1;
 				}
 				if (ib->header.flags & HH_PRIORITY) {
 					// TODO: Parse stream dependency, exclusive, weight
+					if (dec.blk_len < 5) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
 					dec.blk_len -= 5;
 					dec.blk += 5;
 				}
 				if (hpack_decode(client->decoder, &dec) < 0) {
-					log_warn("HPACK decoding error");
-					return -1;
+					//log_debug("HPACK decoding error");
+					send_goaway(client, HH_ERR_COMPRESSION);
+					goto goaway;
 				}
 				break;
 			case HH_FT_PING:
-				if (has_full_frame)
-					client_queue_write(client, ib->payload, ib->header.length);
+				if (!has_full_frame)
+					continue;
+				if (ib->header.length != 8) {
+					send_goaway(client, HH_ERR_FRAME_SIZE);
+					goto goaway;
+				} else if (ib->header.stream_id != 0) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				} else if ((ib->header.flags & HH_PING_ACK) == 0) {
+					// We need to ACK the ping
+					send_ping(client, (uint8_t *)ib->payload, true);
+				}
 				break;
 			case HH_FT_GOAWAY:
 				if (!has_full_frame)
 					continue;
-				log_info("Received GOAWAY with code %u", htonl(*(uint32_t *)&ib->payload[4]));
+				/*if (ib->header.length >= 8)
+					log_debug("Received GOAWAY with code %u", htonl(*(uint32_t *)&ib->payload[4]));*/
 				return -1;
 				break;
 			default:
@@ -457,6 +502,10 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 		}
 	}
 	log_trace();
+	return 0;
+goaway:
+	if (wait_goaway(client) < 0)
+		return -1;
 	return 0;
 }
 
@@ -487,7 +536,6 @@ static int do_read(struct client *client) {
 			rv = -1;
 			goto loop_end;
 		} else {
-			//write(2, recv_buffer, nread); // Debug log the data
 			if (parse_frame(client, recv_buffer, nread) < 0) {
 				rv = -1;
 				goto loop_end;
@@ -510,15 +558,28 @@ static int signal_epollout(struct client *client, bool on) {
 }
 
 static int do_write(struct client *client) {
+	struct buf_chain **pending;
 	do {
+		// Write the highest priority data first
+		pending = &client->low_pri_writes;
+		if (client->high_pri_writes != NULL)
+			pending = &client->high_pri_writes;
+		else if (client->med_pri_writes != NULL)
+			pending = &client->med_pri_writes;
+
 		// Ensure we still have data to write
-		if (client->pending_writes == NULL)
+		if (*pending == NULL)
 			return 0;
+
+		// If we're in the GOAWAY state, stop writing if not high priority
+		if (pending != &client->high_pri_writes && client->state == HH_GOAWAY) {
+			return 0;
+		}
 
 		ssize_t nwritten;
 		s2n_errno = S2N_ERR_T_OK;
-		ssize_t write_len = client->pending_writes->len - client->pending_writes->offset;
-		char *buf_start = client->pending_writes->data + client->pending_writes->offset;
+		ssize_t write_len = (*pending)->len - (*pending)->offset;
+		char *buf_start = (*pending)->data + (*pending)->offset;
 		nwritten = s2n_send(client->tls, buf_start, write_len, &client->blocked);
 		if (nwritten < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
@@ -535,21 +596,21 @@ static int do_write(struct client *client) {
 		} else {
 			// We stil have data to write
 			if (nwritten < write_len) {
-				client->pending_writes->offset += nwritten;
+				(*pending)->offset += nwritten;
 			} else {
 				// Else we have exhausted all the data in this buffer
-				struct buf_chain *buf = buf_pop_chain(client);
+				struct buf_chain *buf = buf_pop_chain(pending);
 				free(buf);
 			}
 		}
 	} while (client->blocked == S2N_NOT_BLOCKED);
 
 	// We still have data remaining, signal EPOLLOUT
-	if (client->pending_writes != NULL && !client->is_write_blocked) {
+	if (*pending != NULL && !client->is_write_blocked) {
 		client->is_write_blocked = true;
 		if (signal_epollout(client, true) < 0)
 			return -1;
-	} else if (client->pending_writes == NULL && client->is_write_blocked) {
+	} else if (*pending == NULL && client->is_write_blocked) {
 		// All data is now written, clear EPOLLOUT
 		client->is_write_blocked = false;
 		if (signal_epollout(client, false) < 0)
@@ -559,16 +620,30 @@ static int do_write(struct client *client) {
 	return 0;
 }
 
-int client_queue_write(struct client *client, char *data, size_t len) {
-	struct buf_chain *last;
-	if (client->pending_writes == NULL) {
-		client->pending_writes = buf_alloc();
-		last = client->pending_writes;
+int client_queue_write(struct client *client, enum write_pri pri, char *data, size_t len) {
+	struct buf_chain *last, **target;
+	switch (pri) {
+		case HH_PRI_HIGH:
+			target = &client->high_pri_writes;
+			break;
+		case HH_PRI_MED:
+			target = &client->med_pri_writes;
+			break;
+		case HH_PRI_LOW:
+			target = &client->low_pri_writes;
+			break;
+		default:
+			log_trace();
+			abort();
+	}
+	if (*target == NULL) {
+		*target = buf_alloc();
+		last = *target;
 	} else
 		// TODO: Make O(1)
-		for (last = client->pending_writes; last->next != NULL; last = last->next)
+		for (last = *target; last->next != NULL; last = last->next)
 			;
-	
+
 	if (last->len < BUF_SIZE) {
 		size_t write_size = MIN(BUF_SIZE - last->len, len);
 		memcpy(last->data + last->len, data, write_size);
@@ -608,13 +683,15 @@ int client_on_write_ready(struct client *client) {
 		case HH_WAITING_MAGIC:
 			log_trace(); // This shouldn't happen
 			break;
-		case HH_WAITING_SETTINGS:
-			// Keep sending SETTINGS frame
+		case HH_WAITING_SETTINGS: // Keep sending SETTINGS frame
+		case HH_IDLE:
 			if (do_write(client) < 0)
 				goto graceful_exit;
 			break;
-		case HH_IDLE:
+		case HH_GOAWAY:
 			if (do_write(client) < 0)
+				goto graceful_exit;
+			if (wait_goaway(client) < 0)
 				goto graceful_exit;
 			break;
 		case HH_TLS_SHUTDOWN:
@@ -628,7 +705,7 @@ int client_on_write_ready(struct client *client) {
 			log_fatal("Unknown client state %d", client->state);
 			exit(-1);
 #endif
-	} 
+	}
 	return 0;
 
 graceful_exit:
@@ -659,11 +736,15 @@ int client_on_data_received(struct client *client) {
 			if (do_read(client) < 0)
 				goto graceful_exit;
 			break;
+		case HH_GOAWAY:
+			if (wait_goaway(client) < 0)
+				goto graceful_exit;
+			break;
 		case HH_TLS_SHUTDOWN:
 			if (send_shutdown(client) < 0)
 				goto error;
 			break;
-		default:	
+		default:
 #ifdef NDEBUG
 			__builtin_unreachable();
 #else

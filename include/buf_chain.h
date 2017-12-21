@@ -16,4 +16,4 @@ struct client;
 
 struct buf_chain *buf_alloc(void);
 void buf_free_chain(struct buf_chain *chain);
-struct buf_chain *buf_pop_chain(struct client *client); // Returns a pointer that needs to be free'd
+struct buf_chain *buf_pop_chain(struct buf_chain **chain); // Returns a pointer that needs to be free'd

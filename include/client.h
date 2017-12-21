@@ -17,6 +17,12 @@ struct h2_settings {
 	uint32_t max_header_list_size;
 };
 
+enum write_pri {
+	HH_PRI_HIGH,
+	HH_PRI_MED,
+	HH_PRI_LOW
+};
+
 struct client {
 	int fd; // This must be first, because of a little epoll hack we use
 	int timer_fd;
@@ -26,6 +32,7 @@ struct client {
 		HH_NEGOTIATING_TLS, // Connection initiated, doing TLS negotiation
 		HH_WAITING_MAGIC, // Waiting for client to send connection preface
 		HH_WAITING_SETTINGS, // Waiting for client to send initial SETTINGS frame
+		HH_GOAWAY, // GOAWAY frame sent, about to shut down client
 		HH_BLINDED, // Blinded by s2n, waiting for timer to expire
 		HH_TLS_SHUTDOWN, // Sent TLS alert, waiting for acknowledgement
 		HH_CLOSED, // Already closed (client disconnected)
@@ -33,7 +40,9 @@ struct client {
 	s2n_blocked_status blocked;
 	bool is_write_blocked;
 	struct ib_frame ib_frame;
-	struct buf_chain *pending_writes;
+	struct buf_chain *low_pri_writes;
+	struct buf_chain *med_pri_writes;
+	struct buf_chain *high_pri_writes;
 	struct h2_settings settings;
 	struct hpack *decoder;
 	//struct hpack *encoder;
@@ -42,7 +51,7 @@ struct client {
 struct client *client_new(int, int, int);
 void client_free(struct client *);
 int close_client(struct client *);
-int client_queue_write(struct client *, char *, size_t);
+int client_queue_write(struct client *, enum write_pri, char *, size_t);
 
 int client_on_timer_expired(struct client *);
 int client_on_write_ready(struct client *);
