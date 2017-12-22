@@ -47,6 +47,7 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	rv->med_pri_writes = NULL;
 	rv->high_pri_writes = NULL;
 	rv->expect_continuation = false;
+	rv->window_size = default_settings.initial_window_size;
 	rv->fd = fd;
 	rv->timer_fd = timer_fd;
 	rv->state = HH_NEGOTIATING_TLS;
@@ -374,10 +375,11 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 			}
 		}
 
+		if (!has_full_frame)
+			continue;
+
 		switch (ib->header.type) {
 			case HH_FT_SETTINGS:
-				if (!has_full_frame)
-					continue;
 				// Parse settings frame
 				if (ib->header.stream_id != 0 || ib->header.length % 6 != 0) {
 					send_goaway(client, ib->header.stream_id != 0 ? HH_ERR_PROTOCOL : HH_ERR_FRAME_SIZE);
@@ -439,8 +441,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				break;
 			case HH_FT_WINDOW_UPDATE:
-				if (!has_full_frame)
-					continue;
 				if (ib->header.length != 4) {
 					send_goaway(client, HH_ERR_FRAME_SIZE);
 					goto goaway;
@@ -459,8 +459,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				break;
 			case HH_FT_CONTINUATION:
 			case HH_FT_HEADERS:
-				if (!has_full_frame)
-					continue;
 				if (ib->header.stream_id == 0) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
@@ -500,8 +498,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				break;
 			case HH_FT_PING:
-				if (!has_full_frame)
-					continue;
 				if (ib->header.length != 8) {
 					send_goaway(client, HH_ERR_FRAME_SIZE);
 					goto goaway;
@@ -514,8 +510,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				break;
 			case HH_FT_GOAWAY:
-				if (!has_full_frame)
-					continue;
 				/*if (ib->header.length >= 8)
 					log_debug("Received GOAWAY with code %u", htonl(*(uint32_t *)&ib->payload[4]));*/
 				return -1;
