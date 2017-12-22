@@ -6,13 +6,16 @@
 
 #define HH_HEADER_SIZE 9
 
+// Frame types
 #define HH_FT_HEADERS 1
+#define HH_FT_RST_STREAM 3
 #define HH_FT_SETTINGS 4
 #define HH_FT_PING 6
 #define HH_FT_GOAWAY 7
 #define HH_FT_WINDOW_UPDATE 8
 #define HH_FT_CONTINUATION 9
 
+// Frame flags
 #define HH_SETTINGS_ACK 1
 #define HH_PING_ACK 1
 #define HH_HEADERS_END_STREAM 1
@@ -20,6 +23,7 @@
 #define HH_PADDED 8
 #define HH_PRIORITY 32
 
+// Error types
 #define HH_ERR_NONE 0
 #define HH_ERR_PROTOCOL 1
 #define HH_ERR_INTERNAL 2
@@ -31,7 +35,7 @@
 #define HH_ERR_CANCEL 8
 #define HH_ERR_COMPRESSION 9
 #define HH_ERR_CONNECT 10
-#define HH_ERR_EHNANCE_YOUR_CALM 11 /* c|:^) */
+#define HH_ERR_EHNANCE_YOUR_CALM 11 // c|:^)
 #define HH_ERR_INADEQUATE_SECURITY 12
 
 struct h2_frame_hd {

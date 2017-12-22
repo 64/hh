@@ -48,7 +48,7 @@ struct client {
 	struct h2_settings settings;
 	struct hpack *decoder;
 	//struct hpack *encoder;
-	struct stream *streams;
+	struct stream root_stream;
 	size_t window_size;
 };
 

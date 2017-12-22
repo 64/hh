@@ -87,7 +87,10 @@ static int load_server_cert(void) {
 	long cert_size = ftell(cert_file);
 	fseek(cert_file, 0, SEEK_SET);
 	char *cert_data = malloc(cert_size + 1);
-	fread(cert_data, cert_size, 1, cert_file);
+	if (fread(cert_data, cert_size, 1, cert_file) != 1) {
+		log_fatal("Call to fread on certificate file failed");
+		return -1;
+	}
 	cert_data[cert_size] = '\0';
 
 	// Read private key file into buffer
@@ -95,7 +98,10 @@ static int load_server_cert(void) {
 	long pkey_size = ftell(pkey_file);
 	fseek(pkey_file, 0, SEEK_SET);
 	char *pkey_data = malloc(pkey_size + 1);
-	fread(pkey_data, pkey_size, 1, pkey_file);
+	if (fread(pkey_data, pkey_size, 1, pkey_file) != 1) {
+		log_fatal("Call to fread on private key file failed");
+		return -1;
+	}
 	pkey_data[pkey_size] = '\0';
 
 	if (s2n_config_add_cert_chain_and_key(server_config, cert_data, pkey_data) != 0) {
@@ -127,7 +133,10 @@ static int queue_fd(int event_fd, int client_fd) {
 
 	// Signal that we added one connection to the queue (wakes up epoll watchers)
 	uint64_t val = 1;
-	write(event_fd, &val, sizeof val);
+	if (write(event_fd, &val, sizeof val) == -1 && errno == EINVAL) {
+		log_fatal("Call to write(event_fd) failed (%s)", strerror(errno));
+		exit(-1);
+	}
 	return 0;
 }
 

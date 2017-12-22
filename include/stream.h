@@ -5,7 +5,7 @@
 
 struct stream {
 	uint32_t id;
-	uint16_t weight;
+	uint16_t weight; // TODO: Maybe make this a uint8_t
 	size_t window_size;
 	enum {
 		HH_STREAM_IDLE,
@@ -16,11 +16,14 @@ struct stream {
 		HH_STREAM_HCLOSED_REMOTE,
 		HH_STREAM_CLOSED
 	} state;
-	struct stream *children; // List of streams that are dependent on this one
-	struct stream *next; // For when the stream is closed, but not freed
+	struct stream *children, *parent, *siblings;
 };
 
 struct stream *stream_alloc(void);
+void stream_add_child(struct stream *stream, struct stream *child);
+void stream_add_exclusive_child(struct stream *stream, struct stream *child);
+struct stream *stream_find_id(struct stream *stream, uint32_t id);
+void stream_free_all(struct stream *root);
 void stream_free(struct stream *);
 
 

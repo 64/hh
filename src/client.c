@@ -56,6 +56,7 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	rv->ib_frame.remaining = 0;
 	rv->ib_frame.payload = NULL;
 	rv->decoder = hpack_decoder(default_settings.header_table_size, -1, hpack_default_alloc);
+	rv->root_stream = (struct stream){ .id = 0, .weight = 256, .parent = NULL, .children = NULL, .siblings = NULL };
 	memcpy(&rv->settings, &default_settings, sizeof default_settings);
 	memset(&rv->ib_frame.header, 0, sizeof rv->ib_frame.header);
 	return rv;
@@ -71,6 +72,8 @@ void client_free(struct client *client) {
 	buf_free_chain(client->low_pri_writes);
 	buf_free_chain(client->med_pri_writes);
 	buf_free_chain(client->high_pri_writes);
+	stream_free_all(client->root_stream.siblings);
+	stream_free_all(client->root_stream.children);
 	hpack_free(&client->decoder);
 	free(client->ib_frame.payload);
 	free(client);
@@ -445,7 +448,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					send_goaway(client, HH_ERR_FRAME_SIZE);
 					goto goaway;
 				}
-				uint32_t increment_size = htonl(*(uint32_t *)ib->payload) & 0x7FFFFFFF;
+				uint32_t increment_size = ntohl(*(uint32_t *)ib->payload) & 0x7FFFFFFF;
 				//log_debug("Received WINDOW_UPDATE frame of size %u", increment_size);
 				if (ib->header.stream_id == 0) {
 					if (increment_size == 0) {
@@ -511,8 +514,25 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				break;
 			case HH_FT_GOAWAY:
 				/*if (ib->header.length >= 8)
-					log_debug("Received GOAWAY with code %u", htonl(*(uint32_t *)&ib->payload[4]));*/
-				return -1;
+					log_debug("Received GOAWAY with code %u", ntohl(*(uint32_t *)&ib->payload[4]));*/
+				return -1; // Shutdown gracefully now
+				break;
+			case HH_FT_RST_STREAM:
+				if (ib->header.length != 4) {
+					send_goaway(client, HH_ERR_FRAME_SIZE);
+					goto goaway;
+				} else if (ib->header.stream_id == 0) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				}
+				struct stream *stream = stream_find_id(&client->root_stream, ib->header.stream_id);
+				if (stream == NULL || stream->state == HH_STREAM_IDLE) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				} else {
+					uint32_t err = ntohl(*(uint32_t *)ib->payload);
+					log_debug("RST_STREAM: id %u, err %u", stream->id, err);
+				}
 				break;
 			default:
 				break;

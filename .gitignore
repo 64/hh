@@ -3,6 +3,7 @@ build/
 test/__pycache__
 vgcore.*
 test/*.pem
+replay.json
 
 # Prerequisites
 *.d
