@@ -46,6 +46,7 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	rv->low_pri_writes = NULL;
 	rv->med_pri_writes = NULL;
 	rv->high_pri_writes = NULL;
+	rv->expect_continuation = false;
 	rv->fd = fd;
 	rv->timer_fd = timer_fd;
 	rv->state = HH_NEGOTIATING_TLS;
@@ -338,7 +339,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					}
 				}
 
-				// TODO: Check header length
+				// Expected a continuation, but our expectation was violated
+				if (client->expect_continuation && ib->header.type != HH_FT_CONTINUATION) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				}
+
 				free(ib->payload);
 				ib->payload = NULL;
 				if (ib->header.length > 0) {
@@ -433,9 +439,25 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				break;
 			case HH_FT_WINDOW_UPDATE:
-				//log_debug("Received WINDOW_UPDATE frame");
-				//write(1, ib->payload, ib->header.length);
+				if (!has_full_frame)
+					continue;
+				if (ib->header.length != 4) {
+					send_goaway(client, HH_ERR_FRAME_SIZE);
+					goto goaway;
+				}
+				uint32_t increment_size = htonl(*(uint32_t *)ib->payload) & 0x7FFFFFFF;
+				//log_debug("Received WINDOW_UPDATE frame of size %u", increment_size);
+				if (ib->header.stream_id == 0) {
+					if (increment_size == 0) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					} else
+						client->window_size += increment_size;
+				} else {
+					// TODO: Implement stream flow control window
+				}
 				break;
+			case HH_FT_CONTINUATION:
 			case HH_FT_HEADERS:
 				if (!has_full_frame)
 					continue;
@@ -452,7 +474,8 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					.cb = hpack_decode_event,
 					.priv = client
 				};
-				if (ib->header.flags & HH_PADDED) {
+				client->expect_continuation = (ib->header.flags & HH_HEADERS_END_HEADERS) == 0;
+				if (ib->header.type == HH_FT_HEADERS && ib->header.flags & HH_PADDED) {
 					uint8_t pad_len = *(uint8_t *)ib->payload;
 					if (pad_len >= ib->header.length) {
 						send_goaway(client, HH_ERR_PROTOCOL);
@@ -461,7 +484,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					dec.blk_len -= pad_len + 1; // 1 for pad_length
 					dec.blk += 1;
 				}
-				if (ib->header.flags & HH_PRIORITY) {
+				if (ib->header.type == HH_FT_HEADERS && ib->header.flags & HH_PRIORITY) {
 					// TODO: Parse stream dependency, exclusive, weight
 					if (dec.blk_len < 5) {
 						send_goaway(client, HH_ERR_PROTOCOL);
@@ -504,14 +527,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 	log_trace();
 	return 0;
 goaway:
-	if (wait_goaway(client) < 0)
-		return -1;
-	return 0;
+	return wait_goaway(client); // do_read() will propogate an exit code up the call stack
 }
 
 static int do_read(struct client *client) {
 	#define READ_LEN 4096
-	char *recv_buffer = malloc(READ_LEN);
+	char recv_buffer[READ_LEN];
 	ssize_t nread;
 	int rv = 0;
 	do {
@@ -543,7 +564,6 @@ static int do_read(struct client *client) {
 		}
 	} while (client->blocked == S2N_NOT_BLOCKED);
 loop_end:
-	free(recv_buffer);
 	return rv;
 }
 
@@ -737,8 +757,8 @@ int client_on_data_received(struct client *client) {
 				goto graceful_exit;
 			break;
 		case HH_GOAWAY:
-			if (wait_goaway(client) < 0)
-				goto graceful_exit;
+			/*if (wait_goaway(client) < 0)
+				goto graceful_exit;*/
 			break;
 		case HH_TLS_SHUTDOWN:
 			if (send_shutdown(client) < 0)

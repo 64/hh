@@ -11,6 +11,7 @@
 #define HH_FT_PING 6
 #define HH_FT_GOAWAY 7
 #define HH_FT_WINDOW_UPDATE 8
+#define HH_FT_CONTINUATION 9
 
 #define HH_SETTINGS_ACK 1
 #define HH_PING_ACK 1

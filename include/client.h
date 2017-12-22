@@ -5,6 +5,7 @@
 
 #include "frame.h"
 #include "buf_chain.h"
+#include "stream.h"
 
 #define CLIENT_EPOLL_EVENTS (EPOLLIN | EPOLLET | EPOLLRDHUP)
 
@@ -39,6 +40,7 @@ struct client {
 	} state;
 	s2n_blocked_status blocked;
 	bool is_write_blocked;
+	bool expect_continuation;
 	struct ib_frame ib_frame;
 	struct buf_chain *low_pri_writes;
 	struct buf_chain *med_pri_writes;
@@ -46,6 +48,8 @@ struct client {
 	struct h2_settings settings;
 	struct hpack *decoder;
 	//struct hpack *encoder;
+	struct stream *streams;
+	size_t window_size;
 };
 
 struct client *client_new(int, int, int);
