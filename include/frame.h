@@ -7,9 +7,12 @@
 #define HH_HEADER_SIZE 9
 
 // Frame types
+#define HH_FT_DATA 0
 #define HH_FT_HEADERS 1
+#define HH_FT_PRIORITY 2
 #define HH_FT_RST_STREAM 3
 #define HH_FT_SETTINGS 4
+#define HH_FT_PUSH_PROMISE 5
 #define HH_FT_PING 6
 #define HH_FT_GOAWAY 7
 #define HH_FT_WINDOW_UPDATE 8
@@ -59,6 +62,7 @@ struct ib_frame {
 struct client;
 struct h2_settings;
 
-int send_goaway(struct client *, uint32_t);
+int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code);
+int send_goaway(struct client *client, uint32_t err_code);
 int send_ping(struct client *client, uint8_t *data, bool ack);
 int send_settings(struct client *client, struct h2_settings *server_settings, bool ack);

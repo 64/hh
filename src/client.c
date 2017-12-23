@@ -46,6 +46,7 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	rv->low_pri_writes = NULL;
 	rv->med_pri_writes = NULL;
 	rv->high_pri_writes = NULL;
+	rv->highest_stream_seen = 0;
 	rv->expect_continuation = false;
 	rv->window_size = default_settings.initial_window_size;
 	rv->fd = fd;
@@ -381,6 +382,67 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 		if (!has_full_frame)
 			continue;
 
+		struct stream *stream = stream_find_id(&client->root_stream, ib->header.stream_id);
+		// Check whether the frame is allowed in this state
+		if (ib->header.stream_id != 0) {
+			int state;
+			if (stream != NULL)
+				state = stream->state;
+			// It's not in the dependency tree, so it must be already closed or not opened
+			else if (ib->header.stream_id <= client->highest_stream_seen)
+				state = HH_STREAM_CLOSED;
+			else
+				state = HH_STREAM_IDLE;
+			switch (state) {
+				case HH_STREAM_IDLE:
+					if (ib->header.type != HH_FT_HEADERS
+					&& ib->header.type != HH_FT_PRIORITY) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
+					break;
+				case HH_STREAM_RESERVED_LOCAL:
+					if (ib->header.type != HH_FT_RST_STREAM
+					&& ib->header.type != HH_FT_PRIORITY
+					&& ib->header.type != HH_FT_WINDOW_UPDATE) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
+					break;
+				case HH_STREAM_RESERVED_REMOTE:
+					if (ib->header.type != HH_FT_HEADERS
+					&& ib->header.type != HH_FT_RST_STREAM
+					&& ib->header.type != HH_FT_PRIORITY) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
+					break;
+				case HH_STREAM_HCLOSED_REMOTE:
+					if (ib->header.type != HH_FT_WINDOW_UPDATE
+					&& ib->header.type != HH_FT_PRIORITY
+					&& ib->header.type != HH_FT_RST_STREAM) {
+						send_rst_stream(client, ib->header.stream_id, HH_ERR_STREAM_CLOSED);
+						// TODO: Change stream state to closed
+						continue;
+					}
+					break;
+				case HH_STREAM_CLOSED:
+					// Technically not standards compliant here. See 5.1@"closed"
+					if (ib->header.type != HH_FT_WINDOW_UPDATE
+					&& ib->header.type != HH_FT_PRIORITY
+					&& ib->header.type != HH_FT_RST_STREAM) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
+					break;
+				// Otherwise we don't care
+				case HH_STREAM_OPEN:
+				case HH_STREAM_HCLOSED_LOCAL:
+				default:
+					break;
+			}
+		}
+
 		switch (ib->header.type) {
 			case HH_FT_SETTINGS:
 				// Parse settings frame
@@ -455,9 +517,19 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 						send_goaway(client, HH_ERR_PROTOCOL);
 						goto goaway;
 					} else
+						// Not realistically going to overflow
 						client->window_size += increment_size;
 				} else {
-					// TODO: Implement stream flow control window
+					if (stream == NULL || stream->state == HH_STREAM_CLOSED) {
+						if (ib->header.stream_id <= client->highest_stream_seen)
+							; // It's closed so ignore it 
+						else
+							assert(0); // Shouldn't happen, we catch IDLE state above
+					} else if (increment_size == 0) {
+						send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
+						// TODO: Change stream state to closed
+					} else
+						stream->window_size += increment_size;
 				}
 				break;
 			case HH_FT_CONTINUATION:
@@ -524,9 +596,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				} else if (ib->header.stream_id == 0) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
-				}
-				struct stream *stream = stream_find_id(&client->root_stream, ib->header.stream_id);
-				if (stream == NULL || stream->state == HH_STREAM_IDLE) {
+				} else if (stream == NULL || stream->state == HH_STREAM_CLOSED) {
+					if (ib->header.stream_id <= client->highest_stream_seen) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
+				} else if (stream->state == HH_STREAM_IDLE) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
 				} else {

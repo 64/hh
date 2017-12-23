@@ -41,6 +41,7 @@ struct client {
 	s2n_blocked_status blocked;
 	bool is_write_blocked;
 	bool expect_continuation;
+	uint32_t highest_stream_seen;
 	struct ib_frame ib_frame;
 	struct buf_chain *low_pri_writes;
 	struct buf_chain *med_pri_writes;

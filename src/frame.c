@@ -17,6 +17,11 @@ struct frame_goaway {
 	uint32_t err_code;
 } __attribute__((packed));
 
+struct frame_rst_stream {
+	struct frame_header header;
+	uint32_t err_code;
+} __attribute__((packed));
+
 struct frame_settings {
 	struct frame_header header;
 	struct {
@@ -42,14 +47,24 @@ static void construct_frame_header(struct frame_header *hd, uint32_t length, uin
 	hd->data[5] = (stream_id >> 24) & 0xFF;
 }
 
+int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code) {
+	assert(stream_id != 0);
+	struct frame_rst_stream rst_stream = { 0 };
+	rst_stream.err_code = htonl(err_code);
+	construct_frame_header(&rst_stream.header, 4, 0, HH_FT_RST_STREAM, stream_id);
+	client_queue_write(client, HH_PRI_MED, (char *)&rst_stream, sizeof rst_stream);
+	return 0;
+}
+
 int send_goaway(struct client *client, uint32_t err_code) {
 	struct frame_goaway goaway = { 0 };
 	if (err_code == 0)
 		goaway.last_stream = htonl(0x7FFFFFFF); // High bit reserved
-	// TODO: else ...
+	else
+		goaway.last_stream = htonl(client->highest_stream_seen);
 	goaway.err_code = htonl(err_code);
 	construct_frame_header(&goaway.header, 8, 0, HH_FT_GOAWAY, 0);
-	client_queue_write(client, HH_PRI_HIGH, (char *)&goaway, sizeof goaway);
+	client_queue_write(client, HH_PRI_MED, (char *)&goaway, sizeof goaway);
 	return 0;
 }
 
