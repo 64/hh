@@ -38,13 +38,13 @@
 #endif
 
 #if LOG_LEVEL >= LOG_LEVEL_DEBUG
-#define log_debug(fmt, ...) fprintf(stdout, "[" GREY "DEBUG" COLOR_RST " - %s:%d] " fmt "\n", __FILE__, __LINE__,##__VA_ARGS__)
+#define log_debug(fmt, ...) fprintf(stderr, "[" GREY "DEBUG" COLOR_RST " - %s:%d] " fmt "\n", __FILE__, __LINE__,##__VA_ARGS__)
 #else
 #define log_debug(fmt, ...) do {} while(0)
 #endif
 
 #if LOG_LEVEL >= LOG_LEVEL_TRACE
-#define log_trace() fprintf(stdout, "[" WHITE "TRACE" COLOR_RST "] %s:%d\n", __FILE__, __LINE__)
+#define log_trace() fprintf(stderr, "[" WHITE "TRACE" COLOR_RST "] %s:%d\n", __FILE__, __LINE__)
 #else
 #define log_trace() do {} while(0)
 #endif

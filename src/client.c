@@ -11,7 +11,6 @@
 #include <assert.h>
 
 #include "client.h"
-#include "buf_chain.h"
 #include "log.h"
 #include "util.h"
 
@@ -42,10 +41,8 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
 	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
+	s2n_connection_prefer_throughput(rv->tls); // Hope s2n buffers writes well for us
 	s2n_connection_set_ctx(rv->tls, rv);
-	rv->low_pri_writes = NULL;
-	rv->med_pri_writes = NULL;
-	rv->high_pri_writes = NULL;
 	rv->highest_stream_seen = 0;
 	rv->expect_continuation = false;
 	rv->window_size = default_settings.initial_window_size;
@@ -58,6 +55,7 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	rv->ib_frame.payload = NULL;
 	rv->decoder = hpack_decoder(default_settings.header_table_size, -1, hpack_default_alloc);
 	rv->root_stream = (struct stream){ .id = 0, .weight = 256, .parent = NULL, .children = NULL, .siblings = NULL };
+	pqueue_init(&rv->pqueue);
 	memcpy(&rv->settings, &default_settings, sizeof default_settings);
 	memset(&rv->ib_frame.header, 0, sizeof rv->ib_frame.header);
 	return rv;
@@ -70,9 +68,7 @@ void client_free(struct client *client) {
 	// TODO: Wipe the connection, don't free it
 	s2n_connection_wipe(client->tls);
 	s2n_connection_free(client->tls);
-	buf_free_chain(client->low_pri_writes);
-	buf_free_chain(client->med_pri_writes);
-	buf_free_chain(client->high_pri_writes);
+	pqueue_free(&client->pqueue);
 	stream_free_all(client->root_stream.siblings);
 	stream_free_all(client->root_stream.children);
 	hpack_free(&client->decoder);
@@ -203,7 +199,7 @@ static int send_shutdown(struct client *client) {
 static int wait_goaway(struct client *client) {
 	change_state(client, HH_GOAWAY);
 	// If there's anything left in the high priority write queue, don't change state yet
-	if (client->high_pri_writes != NULL)
+	if (client->pqueue.high_pri != NULL)
 		return 0;
 	// We can go to TLS shutdown now
 	return -1;
@@ -349,6 +345,8 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
 				}
+
+				// TODO: Check MAX_FRAME_SIZE
 
 				free(ib->payload);
 				ib->payload = NULL;
@@ -522,7 +520,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				} else {
 					if (stream == NULL || stream->state == HH_STREAM_CLOSED) {
 						if (ib->header.stream_id <= client->highest_stream_seen)
-							; // It's closed so ignore it 
+							; // It's closed so ignore it
 						else
 							assert(0); // Shouldn't happen, we catch IDLE state above
 					} else if (increment_size == 0) {
@@ -666,30 +664,24 @@ static int signal_epollout(struct client *client, bool on) {
 	return 0;
 }
 
-static int do_write(struct client *client) {
-	struct buf_chain **pending;
+int client_write_flush(struct client *client) {
+	struct pqueue_node *out;
 	do {
 		// Write the highest priority data first
-		pending = &client->low_pri_writes;
-		if (client->high_pri_writes != NULL)
-			pending = &client->high_pri_writes;
-		else if (client->med_pri_writes != NULL)
-			pending = &client->med_pri_writes;
-
-		// Ensure we still have data to write
-		if (*pending == NULL)
-			return 0;
+		size_t out_len;
+		char *out_data;
+		pqueue_pop_next(&client->pqueue, &out, &out_data, &out_len);
+		if (out == NULL)
+			return 0; // Nothing else to write
 
 		// If we're in the GOAWAY state, stop writing if not high priority
-		if (pending != &client->high_pri_writes && client->state == HH_GOAWAY) {
+		if (out != client->pqueue.high_pri && client->state == HH_GOAWAY) {
 			return 0;
 		}
 
 		ssize_t nwritten;
 		s2n_errno = S2N_ERR_T_OK;
-		ssize_t write_len = (*pending)->len - (*pending)->offset;
-		char *buf_start = (*pending)->data + (*pending)->offset;
-		nwritten = s2n_send(client->tls, buf_start, write_len, &client->blocked);
+		nwritten = s2n_send(client->tls, out_data, out_len, &client->blocked);
 		if (nwritten < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
 				case S2N_ERR_T_CLOSED:
@@ -703,79 +695,21 @@ static int do_write(struct client *client) {
 					return blind_client(client, s2n_connection_get_delay(client->tls));
 			}
 		} else {
-			// We stil have data to write
-			if (nwritten < write_len) {
-				(*pending)->offset += nwritten;
-			} else {
-				// Else we have exhausted all the data in this buffer
-				struct buf_chain *buf = buf_pop_chain(pending);
-				free(buf);
-			}
+			pqueue_report_write(&client->pqueue, out, nwritten);
 		}
 	} while (client->blocked == S2N_NOT_BLOCKED);
 
 	// We still have data remaining, signal EPOLLOUT
-	if (*pending != NULL && !client->is_write_blocked) {
+	if (out != NULL && !client->is_write_blocked) {
 		client->is_write_blocked = true;
 		if (signal_epollout(client, true) < 0)
 			return -1;
-	} else if (*pending == NULL && client->is_write_blocked) {
+	} else if (out == NULL && client->is_write_blocked) {
 		// All data is now written, clear EPOLLOUT
 		client->is_write_blocked = false;
 		if (signal_epollout(client, false) < 0)
 			return -1;
 	}
-
-	return 0;
-}
-
-int client_queue_write(struct client *client, enum write_pri pri, char *data, size_t len) {
-	struct buf_chain *last, **target;
-	switch (pri) {
-		case HH_PRI_HIGH:
-			target = &client->high_pri_writes;
-			break;
-		case HH_PRI_MED:
-			target = &client->med_pri_writes;
-			break;
-		case HH_PRI_LOW:
-			target = &client->low_pri_writes;
-			break;
-		default:
-			log_trace();
-			abort();
-	}
-	if (*target == NULL) {
-		*target = buf_alloc();
-		last = *target;
-	} else
-		// TODO: Make O(1)
-		for (last = *target; last->next != NULL; last = last->next)
-			;
-
-	if (last->len < BUF_SIZE) {
-		size_t write_size = MIN(BUF_SIZE - last->len, len);
-		memcpy(last->data + last->len, data, write_size);
-		last->len += write_size;
-		data += write_size;
-		len -= write_size;
-	}
-
-	// Now buffer is either filled or we have written all the data
-	while (len > 0) {
-		struct buf_chain *buf = buf_alloc();
-		size_t write_size = MIN(BUF_SIZE, len);
-		memcpy(buf->data, data, write_size);
-		data += write_size;
-		len -= write_size;
-		buf->len = write_size;
-		last->next = buf;
-		last = buf;
-	}
-
-	// If we can write it now, do it
-	if (!client->is_write_blocked)
-		return do_write(client);
 	return 0;
 }
 
@@ -794,11 +728,11 @@ int client_on_write_ready(struct client *client) {
 			break;
 		case HH_WAITING_SETTINGS: // Keep sending SETTINGS frame
 		case HH_IDLE:
-			if (do_write(client) < 0)
+			if (client_write_flush(client) < 0)
 				goto graceful_exit;
 			break;
 		case HH_GOAWAY:
-			if (do_write(client) < 0)
+			if (client_write_flush(client) < 0)
 				goto graceful_exit;
 			if (wait_goaway(client) < 0)
 				goto graceful_exit;

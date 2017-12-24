@@ -6,6 +6,7 @@
 #include "frame.h"
 #include "client.h"
 #include "log.h"
+#include "pqueue.h"
 
 struct frame_header {
 	uint8_t data[HH_HEADER_SIZE];
@@ -49,40 +50,52 @@ static void construct_frame_header(struct frame_header *hd, uint32_t length, uin
 
 int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code) {
 	assert(stream_id != 0);
-	struct frame_rst_stream rst_stream = { 0 };
-	rst_stream.err_code = htonl(err_code);
-	construct_frame_header(&rst_stream.header, 4, 0, HH_FT_RST_STREAM, stream_id);
-	client_queue_write(client, HH_PRI_MED, (char *)&rst_stream, sizeof rst_stream);
+	struct pqueue_node *node = pqueue_node_alloc(sizeof(struct frame_rst_stream));
+	struct frame_rst_stream *rst_stream = (struct frame_rst_stream *)&node->data;
+	memset(rst_stream, 0, sizeof *rst_stream);
+	rst_stream->err_code = htonl(err_code);
+	construct_frame_header(&rst_stream->header, 4, 0, HH_FT_RST_STREAM, stream_id);
+	pqueue_submit_frame(&client->pqueue, node, HH_PRI_MED);
+	client_write_flush(client);
 	return 0;
 }
 
 int send_goaway(struct client *client, uint32_t err_code) {
-	struct frame_goaway goaway = { 0 };
+	struct pqueue_node *node = pqueue_node_alloc(sizeof(struct frame_goaway));
+	struct frame_goaway *goaway = (struct frame_goaway *)&node->data;
+	memset(goaway, 0, sizeof *goaway);
 	if (err_code == 0)
-		goaway.last_stream = htonl(0x7FFFFFFF); // High bit reserved
+		goaway->last_stream = htonl(0x7FFFFFFF); // High bit reserved
 	else
-		goaway.last_stream = htonl(client->highest_stream_seen);
-	goaway.err_code = htonl(err_code);
-	construct_frame_header(&goaway.header, 8, 0, HH_FT_GOAWAY, 0);
-	client_queue_write(client, HH_PRI_MED, (char *)&goaway, sizeof goaway);
+		goaway->last_stream = htonl(client->highest_stream_seen);
+	goaway->err_code = htonl(err_code);
+	construct_frame_header(&goaway->header, 8, 0, HH_FT_GOAWAY, 0);
+	pqueue_submit_frame(&client->pqueue, node, HH_PRI_HIGH);
+	client_write_flush(client);
 	return 0;
 }
 
 // Data must be 8 bytes long
 int send_ping(struct client *client, uint8_t *data, bool ack) {
-	struct frame_ping ping = { 0 };
-	memcpy(ping.data, data, 8);
-	construct_frame_header(&ping.header, 8, ack, HH_FT_PING, 0);
-	client_queue_write(client, HH_PRI_HIGH, (char *)&ping, sizeof ping);
+	struct pqueue_node *node = pqueue_node_alloc(sizeof(struct frame_ping));
+	struct frame_ping *ping = (struct frame_ping *)&node->data;
+	memset(ping, 0, sizeof *ping);
+	memcpy(ping->data, data, 8);
+	construct_frame_header(&ping->header, 8, ack, HH_FT_PING, 0);
+	pqueue_submit_frame(&client->pqueue, node, HH_PRI_HIGH);
+	client_write_flush(client);
 	return 0;
 }
 
 // TODO: Implement sending non-empty settings frame
 int send_settings(struct client *client, struct h2_settings *server_settings, bool ack) {
 	(void)server_settings;
-	struct frame_settings settings = { 0 };
-	assert(server_settings == NULL);
-	construct_frame_header(&settings.header, 0, ack, HH_FT_SETTINGS, 0);
-	client_queue_write(client, HH_PRI_MED, (char *)&settings, sizeof settings);
+	struct pqueue_node *node = pqueue_node_alloc(sizeof(struct frame_settings));
+	struct frame_settings *settings = (struct frame_settings *)&node->data;
+	memset(settings, 0, sizeof *settings);
+	assert(server_settings == NULL); // Not implemented yet
+	construct_frame_header(&settings->header, 0, ack, HH_FT_SETTINGS, 0);
+	pqueue_submit_frame(&client->pqueue, node, HH_PRI_MED);
+	client_write_flush(client);
 	return 0;
 }
