@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <string.h>
+#include <stdbool.h>
 #include <assert.h>
 
 #include "pqueue.h"
@@ -73,7 +74,7 @@ int pqueue_submit_frame(struct pqueue *pqueue, struct pqueue_node *frame, enum p
 }
 
 int pqueue_pop_next(struct pqueue *pqueue, struct pqueue_node **out_frame, char **out_data, size_t *out_len) {
-	struct pqueue_node **head;
+	struct pqueue_node **head = NULL;
 	switch (pqueue->write_head) {
 		case HH_PRI_HIGH:
 			head = &pqueue->high_pri;
@@ -142,4 +143,8 @@ int pqueue_report_write(struct pqueue *pqueue, struct pqueue_node *frame, size_t
 		pqueue->write_head = pri;
 	return 0;
 
+}
+
+bool pqueue_is_data_pending(struct pqueue *pqueue) {
+	return pqueue->high_pri || pqueue->med_pri || pqueue->low_pri;
 }

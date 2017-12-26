@@ -8,6 +8,7 @@
 #include <sys/signalfd.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <signal.h>
 #include <pthread.h>
@@ -22,6 +23,7 @@
 
 #include "client.h"
 #include "log.h"
+#include "util.h"
 
 #define DEFAULT_PORT 8000
 #define MAX_EVENTS 64
@@ -160,7 +162,7 @@ static void consume_available_fd(int epoll_fd) {
 
 		// Add the FDs to our epoll collection
 		struct epoll_event event;
-		event.data.ptr = client_new(new_fd, timer_fd, epoll_fd); // Might fail due to mlock limits
+		event.data.ptr = client_new(new_fd, timer_fd); // Might fail due to mlock limits
 		if (event.data.ptr == NULL) {
 			close(new_fd);
 			close(timer_fd);
@@ -205,6 +207,13 @@ static int process_all_incoming_connections(int *event_fds, int server_fd) {
 			}
 		}
 
+		int flag = 1;
+		if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof (int)) < 0) {
+			log_warn("Call to setsockopt(TCP_NODELAY) failed (%s)", strerror(errno));
+			close(client_fd);
+			break;
+		}
+
 		// Send FD to other threads
 		static sig_atomic_t next_thread = 0;
 		if (queue_fd(event_fds[next_thread], client_fd) < 0) {
@@ -219,17 +228,22 @@ static int process_all_incoming_connections(int *event_fds, int server_fd) {
 	return 0;
 }
 
-static void *worker_event_loop(void *arg) {
+static void *worker_event_loop(void *state) {
+	struct thread_state *ts = (struct thread_state *)state;
 	int epoll_fd = epoll_create1(0);
+	ts->epoll_fd = epoll_fd;
 	struct epoll_event *events = calloc(MAX_EVENTS, sizeof(struct epoll_event));
 
-	int event_fd = *(int *)arg; // Points to the eventfd - works since FD is first in struct
+	int event_fd = ts->event_fd;
 	events[0].data.ptr = &event_fd;
 	events[0].events = EPOLLIN | EPOLLET;
 	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, event_fd, &events[0]) == -1) {
 		log_fatal("Call to epoll_ctl failed (%s)", strerror(errno));
 		return NULL;
 	}
+
+	set_thread_state(state);
+	free(state);
 
 	// Add the signal_fd to our set to epoll
 	events[0].data.ptr = &signal_fd;
@@ -252,10 +266,10 @@ static void *worker_event_loop(void *arg) {
 			bool timer_expired = (uintptr_t)(events[i].data.ptr) & 1;
 			struct client *client = (struct client *)((uintptr_t)events[i].data.ptr & ~1);
 			if (events[i].events & EPOLLRDHUP) {
-				close_client(client);
+				client_close_immediate(client);
 				continue;
 			} else if (events[i].events & EPOLLHUP) {
-				close_client(client);
+				client_close_immediate(client);
 				continue;
 			} else if (events[i].events & EPOLLERR) {
 				if (!timer_expired && client->fd != event_fd && client->fd != signal_fd) {
@@ -267,27 +281,35 @@ static void *worker_event_loop(void *arg) {
 						log_warn("Epoll event error on socket (flags %d)", events[i].events);
 				} else
 					log_warn("Epoll event error (flags %d)", events[i].events);
-				close_client(client);
+				client_close_immediate(client);
 				continue;
-			} else if (events[i].events & EPOLLIN) {
+			}
+			if (events[i].events & EPOLLIN) {
 				if (client->fd == event_fd) {
 					uint64_t efd_read;
 					if (read(event_fd, &efd_read, sizeof efd_read) > 0)
 						consume_available_fd(epoll_fd);
+					continue;
 				} else if (timer_expired) {
 					if (client_on_timer_expired(client) < 0) {
-						close_client(client);
+						client_close_immediate(client);
 					}
 					continue;
 				} else if (client->fd == signal_fd) {
 					should_exit = 1; // Maybe we should check which signal?
+					break;
 				} else if (client_on_data_received(client) < 0) {
-					continue;
+					continue; // Client has been immediately closed
 				}
 			}
-			if (events[i].events & EPOLLOUT) {
+			if (events[i].events & EPOLLOUT || pqueue_is_data_pending(&client->pqueue)) {
 				if (client_on_write_ready(client) < 0) {
-					continue;
+					continue; // Client has been immediately closed
+				}
+			}
+			if (client->is_closing) {
+				if (client_close_graceful(client) < 0) {
+					client_close_immediate(client);	
 				}
 			}
 		}
@@ -396,7 +418,10 @@ static int server_listen(int server_fd, unsigned short port) {
 	// Start worker threads
 	pthread_t worker_threads[WORKER_THREADS];
 	for (size_t i = 0; i < WORKER_THREADS; i++) {
-		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, &event_fds[i])) != 0) {
+		struct thread_state *state = malloc(sizeof *state);
+		state->event_fd = event_fds[i];
+		state->epoll_fd = -1;
+		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, state)) != 0) {
 			log_fatal("Call to pthread_create failed (%s)", strerror(errno));
 			return -1;
 		}

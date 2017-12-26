@@ -2,6 +2,7 @@
 #include <string.h>
 #include <assert.h>
 #include "stream.h"
+#include "log.h"
 
 struct stream *stream_alloc(void) {
 	struct stream *rv = malloc(sizeof *rv);
@@ -41,10 +42,39 @@ struct stream *stream_find_id(struct stream *stream, uint32_t id) {
 		return NULL;
 	else if (stream->id == id)
 		return stream;
-	struct stream *tmp = stream_find_id(stream->children, id);
+	struct stream *tmp = stream_find_id(stream->siblings, id);
 	if (tmp != NULL)
 		return tmp;
-	return stream_find_id(stream->siblings, id);
+	return stream_find_id(stream->children, id);
+}
+
+int stream_change_state(struct stream *stream, enum stream_state new_state) {
+	switch (stream->state) {
+		case HH_STREAM_IDLE:
+			switch (new_state) {
+				case HH_STREAM_OPEN:
+					stream->state = new_state;
+					break;
+				default:
+					goto verybad;
+			}
+			break;
+		case HH_STREAM_OPEN:
+			switch (new_state) {
+				case HH_STREAM_OPEN:
+					break;
+				default:
+					goto verybad;
+			}
+			break;
+		default:
+		verybad:
+			// TODO: Error handle
+			log_debug("Unknown stream state transition from %d to %d", stream->state, new_state);
+			abort();
+			break;
+	}
+	return 0;
 }
 
 // TODO: Don't use recursion

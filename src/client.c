@@ -16,10 +16,13 @@
 
 #define CLIENT_MAGIC "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 #define CLIENT_MAGIC_LEN 24
+#define CLIENT_INITIAL_HDBUF_SIZE (1 << 13)
 
 extern struct s2n_config *server_config;
 
-_Thread_local int epoll_fd = -1;
+_Thread_local struct thread_state thread_state;
+
+static int change_state(struct client *client, enum client_state to);
 
 struct h2_settings default_settings = {
 	.header_table_size = 4096,
@@ -30,8 +33,11 @@ struct h2_settings default_settings = {
 	.max_header_list_size = 0xFFFFFFFF
 };
 
-struct client *client_new(int fd, int timer_fd, int efd) {
-	epoll_fd = efd;
+void set_thread_state(struct thread_state *ts) {
+	memcpy(&thread_state, ts, sizeof *ts);
+}
+
+struct client *client_new(int fd, int timer_fd) {
 	struct client *rv = malloc(sizeof(struct client));
 	rv->tls = s2n_connection_new(S2N_SERVER);
 	if (rv->tls == NULL) {
@@ -44,18 +50,20 @@ struct client *client_new(int fd, int timer_fd, int efd) {
 	s2n_connection_prefer_throughput(rv->tls); // Hope s2n buffers writes well for us
 	s2n_connection_set_ctx(rv->tls, rv);
 	rv->highest_stream_seen = 0;
-	rv->expect_continuation = false;
+	rv->continuation_on_stream = 0;
 	rv->window_size = default_settings.initial_window_size;
 	rv->fd = fd;
 	rv->timer_fd = timer_fd;
 	rv->state = HH_NEGOTIATING_TLS;
+	rv->is_closing = false;
 	rv->is_write_blocked = false;
 	rv->blocked = S2N_NOT_BLOCKED;
 	rv->ib_frame.remaining = 0;
 	rv->ib_frame.payload = NULL;
-	rv->decoder = hpack_decoder(default_settings.header_table_size, -1, hpack_default_alloc);
+	rv->hpack_state = hpack_decoder(default_settings.header_table_size, -1, hpack_default_alloc);
 	rv->root_stream = (struct stream){ .id = 0, .weight = 256, .parent = NULL, .children = NULL, .siblings = NULL };
 	pqueue_init(&rv->pqueue);
+	rv->hdblock = malloc(CLIENT_INITIAL_HDBUF_SIZE);
 	memcpy(&rv->settings, &default_settings, sizeof default_settings);
 	memset(&rv->ib_frame.header, 0, sizeof rv->ib_frame.header);
 	return rv;
@@ -71,12 +79,13 @@ void client_free(struct client *client) {
 	pqueue_free(&client->pqueue);
 	stream_free_all(client->root_stream.siblings);
 	stream_free_all(client->root_stream.children);
-	hpack_free(&client->decoder);
+	hpack_free(&client->hpack_state);
 	free(client->ib_frame.payload);
+	free(client->hdblock);
 	free(client);
 }
 
-int close_client(struct client *client) {
+void client_close_immediate(struct client *client) {
 	int rv = close(client->fd);
 	if (rv < 0)
 		log_warn("Call to close(client) failed (%s)", strerror(errno));
@@ -84,12 +93,54 @@ int close_client(struct client *client) {
 	if (rv < 0)
 		log_warn("Call to close(client->timer_fd) failed (%s)", strerror(errno));
 	client_free(client);
-	return rv;
+}
+
+static void initiate_graceful_close(struct client *client) {
+	client->is_closing = true;
+	if (client->state == HH_NEGOTIATING_TLS || client->state == HH_ALREADY_CLOSED)
+		return;
+	else if (client->state == HH_IDLE)
+		change_state(client, HH_GOAWAY);
+	else if (client->state != HH_TLS_SHUTDOWN && client->state != HH_GOAWAY)
+		change_state(client, HH_TLS_SHUTDOWN);
+}
+
+// Returns -1 when callers should call client_close_immediate
+int client_close_graceful(struct client *client) {
+	if (client->state == HH_NEGOTIATING_TLS || client->state == HH_ALREADY_CLOSED)
+		return -1;
+	assert(client->state == HH_GOAWAY || client->state == HH_TLS_SHUTDOWN);
+	assert(client->is_closing);
+	if (client->state == HH_GOAWAY) {
+		// Wait until the GOAWAY frame has been sent
+		if (client->pqueue.high_pri == NULL)
+			change_state(client, HH_TLS_SHUTDOWN);
+		else
+			return 0;
+	}
+	if (client->state == HH_TLS_SHUTDOWN) {
+		if (s2n_shutdown(client->tls, &client->blocked) < 0) {
+			switch(s2n_error_get_type(s2n_errno)) {
+				case S2N_ERR_T_BLOCKED:
+					return 0;
+				case S2N_ERR_T_IO:
+					log_debug("Call to s2n_shutdown failed (%s)", strerror(errno));
+					return -1;
+				default:
+					return -1;
+			}
+		}
+	}
+	// Graceful shutdown was successful, we can close now
+	return -1;
 }
 
 // Big state machine.
 static int change_state(struct client *client, enum client_state to) {
 	if (to == HH_BLINDED) {
+		client->state = to;
+		return 0;
+	} else if (to == HH_ALREADY_CLOSED) {
 		client->state = to;
 		return 0;
 	}
@@ -98,7 +149,6 @@ static int change_state(struct client *client, enum client_state to) {
 		case HH_IDLE:
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
-				case HH_CLOSED:
 				case HH_GOAWAY:
 					client->state = to;
 					break;
@@ -109,7 +159,6 @@ static int change_state(struct client *client, enum client_state to) {
 		case HH_WAITING_MAGIC:
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
-				case HH_CLOSED:
 				case HH_WAITING_SETTINGS:
 					client->state = to;
 					break;
@@ -120,7 +169,6 @@ static int change_state(struct client *client, enum client_state to) {
 		case HH_WAITING_SETTINGS:
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
-				case HH_CLOSED:
 				case HH_GOAWAY:
 				case HH_IDLE:
 					client->state = to;
@@ -136,9 +184,6 @@ static int change_state(struct client *client, enum client_state to) {
 					client->ib_frame.remaining = CLIENT_MAGIC_LEN;
 					send_settings(client, NULL, false); // Server connection preface
 					break;
-				case HH_CLOSED:
-					client->state = to;
-					break;
 				default:
 					goto verybad;
 			}
@@ -146,9 +191,9 @@ static int change_state(struct client *client, enum client_state to) {
 		case HH_GOAWAY:
 			switch (to) {
 				case HH_TLS_SHUTDOWN:
-				case HH_GOAWAY:
-				case HH_CLOSED:
+					client->state = to;
 					break;
+				case HH_GOAWAY:
 				default:
 					goto verybad;
 			}
@@ -157,13 +202,10 @@ static int change_state(struct client *client, enum client_state to) {
 			switch (to) {
 				case HH_TLS_SHUTDOWN: // Treat as no-op for simplicity
 					break;
-				case HH_CLOSED:
-					break;
 				default:
 					goto verybad;
 			}
 			break;
-		case HH_CLOSED:
 		verybad:
 		default:
 #ifdef NDEBUG
@@ -175,34 +217,6 @@ static int change_state(struct client *client, enum client_state to) {
 #endif
 	}
 	return 0;
-}
-
-// Initiates a graceful shutdown
-// Returns -1 when callers should call close_client
-static int send_shutdown(struct client *client) {
-	if (s2n_shutdown(client->tls, &client->blocked) < 0) {
-		switch(s2n_error_get_type(s2n_errno)) {
-			case S2N_ERR_T_BLOCKED:
-				change_state(client, HH_TLS_SHUTDOWN);
-				return 0;
-			default:
-				//log_debug("Call to s2n_shutdown failed (%s)", s2n_strerror(s2n_errno, "EN"));
-				change_state(client, HH_CLOSED);
-				return -1;
-		}
-	}
-	// Graceful shutdown was successful, we can close now
-	return -1;
-}
-
-// Returns -1 when goaway has been sent
-static int wait_goaway(struct client *client) {
-	change_state(client, HH_GOAWAY);
-	// If there's anything left in the high priority write queue, don't change state yet
-	if (client->pqueue.high_pri != NULL)
-		return 0;
-	// We can go to TLS shutdown now
-	return -1;
 }
 
 static int blind_client(struct client *client, uint64_t ns) {
@@ -270,14 +284,66 @@ static void hpack_decode_event(enum hpack_event_e evt, const char *buf, size_t s
 	(void)size; (void)priv; (void)buf;
 	switch (evt) {
 		case HPACK_EVT_VALUE:
-			//printf(": %s\n", buf);
+			printf(": %s\n", buf);
 			break;
 		case HPACK_EVT_NAME:
-			//printf("%s", buf);
+			printf("%s", buf);
 			break;
 		default:
 			break;
 	}
+}
+
+static struct stream *update_stream(struct client *client, struct stream *stream, uint32_t stream_id, uint8_t *pri_data,
+		enum stream_state state_if_created) {
+	bool exclusive = false;
+	uint32_t dependency = 0;
+	uint16_t weight = 16;
+	if (pri_data != NULL) {
+		memcpy(&dependency, pri_data, sizeof dependency);
+		dependency = ntohl(dependency);
+		if ((dependency & (1U << 31)) != 0) // E(xclusive) bit
+			exclusive = true;
+		dependency &= ~(1U << 31); // Ignore E bit
+		weight = *(uint8_t *)(pri_data + 4);
+	}
+	// Create new stream if needed
+	if (stream == NULL) {
+		stream = stream_alloc();
+		stream->weight = weight;
+		stream->id = stream_id;
+		stream->window_size = client->settings.initial_window_size;
+		stream->state = state_if_created;
+	}
+	// If parent is null, we just created stream
+	if (dependency == stream_id) {
+		stream_free(stream);
+		return NULL;
+	}
+	if (stream->id > client->highest_stream_seen) {
+		client->highest_stream_seen = stream->id;
+		if (state_if_created == HH_STREAM_OPEN) {
+			// TODO: Close all idle streams <= stream->id
+		}
+	}
+	if (stream->parent == NULL || stream->parent->id != dependency) {
+		struct stream *new_parent = stream_find_id(&client->root_stream, dependency);
+		if (new_parent == NULL) {
+			// Create the parent
+			new_parent = stream_alloc();
+			new_parent->weight = 16;
+			new_parent->id = dependency;
+			new_parent->state = HH_STREAM_IDLE;
+			new_parent->window_size = client->settings.initial_window_size;
+			stream_add_child(&client->root_stream, new_parent);
+		}
+		if (exclusive)
+			stream_add_exclusive_child(new_parent, stream);
+		else
+			stream_add_child(new_parent, stream);
+	}
+	//log_debug("Openened stream %u, weight %u, depends %u", stream_id, stream->weight, dependency);
+	return stream;
 }
 
 static int parse_frame(struct client *client, char *buf, size_t len) {
@@ -325,11 +391,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				ib->header.type = ib->temp_buf[3];
 				ib->header.flags = ib->temp_buf[4];
 				memcpy(&tmp, ib->temp_buf + 5, sizeof(uint32_t));
-				ib->header.stream_id = ntohl(tmp & 0x7FFFFFFF);
+				ib->header.stream_id = ntohl(tmp) & 0x7FFFFFFF;
 				memcpy(&tmp, ib->temp_buf, sizeof(uint32_t));
 				ib->header.length = ntohl(tmp & 0xFFFFFF00) >> 8;
 
 				// If we were waiting for the initial SETTINGS frame
+				// TODO: Don't wait for the client before sending our own settings frame
 				if (client->state == HH_WAITING_SETTINGS) {
 					// It wasn't a settings frame
 					if (ib->header.type != HH_FT_SETTINGS || (ib->header.flags & HH_SETTINGS_ACK) != 0) {
@@ -341,12 +408,16 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 
 				// Expected a continuation, but our expectation was violated
-				if (client->expect_continuation && ib->header.type != HH_FT_CONTINUATION) {
+				if (client->continuation_on_stream != 0 &&
+						(ib->header.type != HH_FT_CONTINUATION
+						|| ib->header.stream_id != client->continuation_on_stream)) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
 				}
 
-				// TODO: Check MAX_FRAME_SIZE
+				if (ib->header.length > default_settings.max_frame_size) {
+					send_goaway(client, HH_ERR_FRAME_SIZE);
+				}
 
 				free(ib->payload);
 				ib->payload = NULL;
@@ -530,47 +601,100 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 						stream->window_size += increment_size;
 				}
 				break;
-			case HH_FT_CONTINUATION:
-			case HH_FT_HEADERS:
+			case HH_FT_PRIORITY:
 				if (ib->header.stream_id == 0) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
+				} else if (ib->header.length != 5) {
+					send_goaway(client, HH_ERR_FRAME_SIZE);
+					goto goaway;
 				}
-				char buf[1024];
-				struct hpack_decoding dec = {
-					.blk = ib->payload,
-					.blk_len = ib->header.length,
-					.buf = buf,
-					.buf_len = sizeof buf,
-					.cb = hpack_decode_event,
-					.priv = client
-				};
-				client->expect_continuation = (ib->header.flags & HH_HEADERS_END_HEADERS) == 0;
-				if (ib->header.type == HH_FT_HEADERS && ib->header.flags & HH_PADDED) {
+				stream = update_stream(client, stream, ib->header.stream_id, (uint8_t *)ib->payload, HH_STREAM_IDLE);
+				if (stream == NULL) {
+					// Circular dependency
+					send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
+					continue;
+				}
+				break;
+			case HH_FT_CONTINUATION:
+				if (stream == NULL || (ib->header.flags & (HH_PADDED | HH_PRIORITY)) != 0) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				}
+				__attribute__((fallthrough));
+			case HH_FT_HEADERS: {
+				uint8_t *new_stream_pri_info = NULL;
+				uint8_t *decode_start = (uint8_t *)ib->payload;
+				size_t decode_len = ib->header.length;
+				if (ib->header.stream_id == 0) {
+					send_goaway(client, HH_ERR_PROTOCOL);
+					goto goaway;
+				} else if (stream == NULL) {
+					// TODO: Check number of open streams
+					// Odd numbered streams from client
+					if (ib->header.stream_id % 2 != 1) {
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					}
+				}
+				client->continuation_on_stream =
+					(ib->header.flags & HH_HEADERS_END_HEADERS) == 0 ? ib->header.stream_id : 0;
+				if (ib->header.flags & HH_PADDED) {
 					uint8_t pad_len = *(uint8_t *)ib->payload;
 					if (pad_len >= ib->header.length) {
 						send_goaway(client, HH_ERR_PROTOCOL);
 						goto goaway;
 					}
-					dec.blk_len -= pad_len + 1; // 1 for pad_length
-					dec.blk += 1;
+					decode_len -= pad_len + 1; // 1 for the pad_length itself
+					decode_start += 1;
 				}
-				if (ib->header.type == HH_FT_HEADERS && ib->header.flags & HH_PRIORITY) {
-					// TODO: Parse stream dependency, exclusive, weight
-					if (dec.blk_len < 5) {
+				if (ib->header.flags & HH_PRIORITY) {
+					if (decode_len < 5) {
 						send_goaway(client, HH_ERR_PROTOCOL);
 						goto goaway;
 					}
-					dec.blk_len -= 5;
-					dec.blk += 5;
+					new_stream_pri_info = decode_start;
+					decode_len -= 5;
+					decode_start += 5;
 				}
-				if (hpack_decode(client->decoder, &dec) < 0) {
-					//log_debug("HPACK decoding error");
-					send_goaway(client, HH_ERR_COMPRESSION);
-					goto goaway;
+				// TODO: Check for END_STREAM
+				stream = update_stream(client, stream, ib->header.stream_id, new_stream_pri_info, HH_STREAM_OPEN);
+				if (stream == NULL) {
+					// Circular dependency
+					send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
+					continue;
 				}
+				struct hpack_decoding dec = {
+					.blk = decode_start,
+					.blk_len = decode_len,
+					.buf = client->hdblock,
+					.buf_len = CLIENT_INITIAL_HDBUF_SIZE,
+					.cb = hpack_decode_event,
+					.priv = client,
+					.cut = !(ib->header.flags & HH_HEADERS_END_HEADERS)
+				};
+				int rv;
+				if ((rv = hpack_decode(client->hpack_state, &dec)) < 0) {
+					switch (rv) {
+						case HPACK_RES_BLK: // Partial block
+							break;
+						case HPACK_RES_SKP: // Buffer not large enough, recoverable
+							log_trace();
+							assert(hpack_skip(client->hpack_state) == HPACK_RES_OK);
+							send_rst_stream(client, ib->header.stream_id, HH_ERR_REFUSED_STREAM);
+							continue;
+						case HPACK_RES_BIG: // Buffer not large enough, fatal
+							send_goaway(client, HH_ERR_PROTOCOL);
+							goto goaway;
+						default:
+							log_debug("Call to hpack_decode failed (%s)", hpack_strerror(rv));
+							send_goaway(client, HH_ERR_COMPRESSION);
+							goto goaway;
+					}
+				}
+				stream_change_state(stream, HH_STREAM_OPEN);
 				break;
-			case HH_FT_PING:
+			} case HH_FT_PING:
 				if (ib->header.length != 8) {
 					send_goaway(client, HH_ERR_FRAME_SIZE);
 					goto goaway;
@@ -614,7 +738,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 	log_trace();
 	return 0;
 goaway:
-	return wait_goaway(client); // do_read() will propogate an exit code up the call stack
+	return -1;
 }
 
 static int do_read(struct client *client) {
@@ -627,11 +751,13 @@ static int do_read(struct client *client) {
 		if ((nread = s2n_recv(client->tls, recv_buffer, READ_LEN, &client->blocked)) < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
 				case S2N_ERR_T_CLOSED:
+					change_state(client, HH_ALREADY_CLOSED);
 					rv = -1;
 					goto loop_end;
 				case S2N_ERR_T_BLOCKED:
 					break;
 				case S2N_ERR_T_IO:
+					log_trace();
 					rv = blind_client(client, s2n_connection_get_delay(client->tls));
 					goto loop_end;
 				default:
@@ -641,6 +767,7 @@ static int do_read(struct client *client) {
 			}
 		} else if (nread == 0) {
 			// Client disconnected, signal shutdown
+			change_state(client, HH_ALREADY_CLOSED);
 			rv = -1;
 			goto loop_end;
 		} else {
@@ -659,7 +786,7 @@ static int signal_epollout(struct client *client, bool on) {
 	ev.data.ptr = client;
 	ev.events = CLIENT_EPOLL_EVENTS;
 	if (on)	ev.events |= EPOLLOUT;
-	if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) < 0)
+	if (epoll_ctl(thread_state.epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) < 0)
 		return -1;
 	return 0;
 }
@@ -732,14 +859,7 @@ int client_on_write_ready(struct client *client) {
 				goto graceful_exit;
 			break;
 		case HH_GOAWAY:
-			if (client_write_flush(client) < 0)
-				goto graceful_exit;
-			if (wait_goaway(client) < 0)
-				goto graceful_exit;
-			break;
 		case HH_TLS_SHUTDOWN:
-			if (send_shutdown(client) < 0)
-				goto error;
 			break;
 		default:
 #ifdef NDEBUG
@@ -752,11 +872,9 @@ int client_on_write_ready(struct client *client) {
 	return 0;
 
 graceful_exit:
-	if (send_shutdown(client) < 0)
-		goto error;
+	initiate_graceful_close(client);
 	return 0;
 error:
-	close_client(client);
 	return -1;
 }
 
@@ -780,12 +898,7 @@ int client_on_data_received(struct client *client) {
 				goto graceful_exit;
 			break;
 		case HH_GOAWAY:
-			/*if (wait_goaway(client) < 0)
-				goto graceful_exit;*/
-			break;
 		case HH_TLS_SHUTDOWN:
-			if (send_shutdown(client) < 0)
-				goto error;
 			break;
 		default:
 #ifdef NDEBUG
@@ -798,10 +911,8 @@ int client_on_data_received(struct client *client) {
 	return 0;
 
 graceful_exit:
-	if (send_shutdown(client) < 0)
-		goto error;
+	initiate_graceful_close(client);
 	return 0;
 error:
-	close_client(client);
 	return -1;
 }

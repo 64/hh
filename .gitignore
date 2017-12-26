@@ -4,6 +4,7 @@ test/__pycache__
 vgcore.*
 test/*.pem
 replay.json
+massif.*
 
 # Prerequisites
 *.d

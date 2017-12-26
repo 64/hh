@@ -5,9 +5,7 @@ TEST := test
 EXE := hh
 
 CFLAGS += -Wall -Wextra -std=gnu11 -Iinclude -DWORKER_THREADS=3
-HPACKER_CFLAGS += -Wall -Wextra -std=c99
 LDLIBS += -ls2n -lcrypto -pthread -l:libhpack.a
-HPACKER_LDLIBS += -pthread
 
 SRCS := $(shell find $(SRC) -name "*.c")
 OBJS := $(addprefix $(BUILD)/,$(notdir $(patsubst %.c,%.o,$(SRCS))))
@@ -17,11 +15,9 @@ DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 .PHONY: all clean run test valgrind rebuild cloc hexdump
 
 ifeq ($(HH_DEBUG),1)
-  CFLAGS += -O0 -g -DLOG_LEVEL=4 -fsanitize=address,undefined
-  HPACKER_CFLAGS += -O0 -g -fsanitize=address,undefined
+  CFLAGS += -Og -g -DLOG_LEVEL=4 #-fsanitize=address,undefined
 else
   CFLAGS += -O2 -DNDEBUG -DLOG_LEVEL=2
-  HPACKER_CFLAGS += -O2 -DNDEBUG
 endif
 
 all: $(BUILD)/$(EXE) $(BUILD)/$(HPACKER)

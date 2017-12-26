@@ -30,3 +30,4 @@ void pqueue_node_free(struct pqueue_node *frame);
 int pqueue_submit_frame(struct pqueue *pqueue, struct pqueue_node *frame, enum pqueue_pri priority);
 int pqueue_pop_next(struct pqueue *pqueue, struct pqueue_node **out_frame, char **out_data, size_t *out_len);
 int pqueue_report_write(struct pqueue *pqueue, struct pqueue_node *frame, size_t len_written);
+bool pqueue_is_data_pending(struct pqueue *pqueue);

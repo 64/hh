@@ -6,6 +6,7 @@
 #include "frame.h"
 #include "pqueue.h"
 #include "stream.h"
+#include "util.h"
 
 #define CLIENT_EPOLL_EVENTS (EPOLLIN | EPOLLET | EPOLLRDHUP)
 
@@ -30,25 +31,28 @@ struct client {
 		HH_GOAWAY, // GOAWAY frame sent, about to shut down client
 		HH_BLINDED, // Blinded by s2n, waiting for timer to expire
 		HH_TLS_SHUTDOWN, // Sent TLS alert, waiting for acknowledgement
-		HH_CLOSED, // Already closed (client disconnected)
+		HH_ALREADY_CLOSED, // Socket already closed
 	} state;
 	s2n_blocked_status blocked;
 	bool is_write_blocked;
-	bool expect_continuation;
+	bool is_closing;
+	uint32_t continuation_on_stream;
 	uint32_t highest_stream_seen;
+	uint8_t *hdblock;
 	struct ib_frame ib_frame;
 	struct pqueue pqueue;
 	struct h2_settings settings;
-	struct hpack *decoder;
-	//struct hpack *encoder;
+	struct hpack *hpack_state;
 	struct stream root_stream;
 	size_t window_size;
 };
 
-struct client *client_new(int, int, int);
+void set_thread_state(struct thread_state *);
+struct client *client_new(int, int);
 void client_free(struct client *);
-int close_client(struct client *);
 int client_write_flush(struct client *);
+void client_close_immediate(struct client *);
+int client_close_graceful(struct client *);
 
 int client_on_timer_expired(struct client *);
 int client_on_write_ready(struct client *);
