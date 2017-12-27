@@ -49,6 +49,7 @@ struct client *client_new(int fd, int timer_fd) {
 	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
 	s2n_connection_prefer_throughput(rv->tls); // Hope s2n buffers writes well for us
 	s2n_connection_set_ctx(rv->tls, rv);
+	streamtab_alloc(&rv->streams);
 	rv->highest_stream_seen = 0;
 	rv->continuation_on_stream = 0;
 	rv->window_size = default_settings.initial_window_size;
@@ -60,8 +61,8 @@ struct client *client_new(int fd, int timer_fd) {
 	rv->blocked = S2N_NOT_BLOCKED;
 	rv->ib_frame.remaining = 0;
 	rv->ib_frame.payload = NULL;
-	rv->hpack_state = hpack_decoder(default_settings.header_table_size, -1, hpack_default_alloc);
-	rv->root_stream = (struct stream){ .id = 0, .weight = 256, .parent = NULL, .children = NULL, .siblings = NULL };
+	rv->encoder = hpack_encoder(default_settings.header_table_size, -1, hpack_default_alloc);
+	rv->decoder = hpack_decoder(default_settings.header_table_size, (1 << 12), hpack_default_alloc);
 	pqueue_init(&rv->pqueue);
 	rv->hdblock = malloc(CLIENT_INITIAL_HDBUF_SIZE);
 	memcpy(&rv->settings, &default_settings, sizeof default_settings);
@@ -77,9 +78,9 @@ void client_free(struct client *client) {
 	s2n_connection_wipe(client->tls);
 	s2n_connection_free(client->tls);
 	pqueue_free(&client->pqueue);
-	stream_free_all(client->root_stream.siblings);
-	stream_free_all(client->root_stream.children);
-	hpack_free(&client->hpack_state);
+	streamtab_free(&client->streams);
+	hpack_free(&client->encoder);
+	hpack_free(&client->decoder);
 	free(client->ib_frame.payload);
 	free(client->hdblock);
 	free(client);
@@ -280,18 +281,62 @@ static int do_negotiate(struct client *client) {
 	return 0;
 }
 
-static void hpack_decode_event(enum hpack_event_e evt, const char *buf, size_t size, void *priv) {
-	(void)size; (void)priv; (void)buf;
-	switch (evt) {
-		case HPACK_EVT_VALUE:
-			printf(": %s\n", buf);
-			break;
-		case HPACK_EVT_NAME:
-			printf("%s", buf);
-			break;
-		default:
-			break;
+static int process_header(struct stream *stream, char *name, char *value, bool *stream_err) {
+	//printf("%s: %s\n", name, value);
+	// TODO: Use gprof or something to create a hash function for the strings in here
+	// This is probably very slow and needs benchmarking
+	if (*name == ':') {
+		if (stream->req.pseudos.done) {
+			*stream_err = true;
+			return HH_ERR_PROTOCOL;
+		}
+	} else
+		stream->req.pseudos.done = true;
+
+	if (strcmp(name, ":path") == 0) {
+		if (stream->req.pseudos.has_path) {
+			*stream_err = true;
+			return HH_ERR_PROTOCOL;
+		} else if (*value != '/') {
+			*stream_err = true;
+			return HH_ERR_PROTOCOL;
+		} else
+			stream->req.pseudos.has_path = true;
+	} else if (strcmp(name, ":method") == 0) {
+		if (stream->req.pseudos.has_method) {
+			*stream_err = true;
+			return HH_ERR_PROTOCOL;
+		} else
+			stream->req.pseudos.has_method = true;
+	} else if (strcmp(name, ":scheme") == 0) {
+		if (stream->req.pseudos.has_scheme) {
+			*stream_err = true;
+			return HH_ERR_PROTOCOL;
+		} else
+			stream->req.pseudos.has_scheme = true;
+	} else if (strcmp(name, ":status") == 0 || strcmp(name, "connection") == 0) {
+		*stream_err = true;
+		return HH_ERR_PROTOCOL;
+	} else if (strcmp(name, "te") == 0) {
+		if (strcmp(value, "trailers") != 0) {
+			*stream_err = true;
+			return HH_ERR_PROTOCOL;
+		}
 	}
+	return 0;
+}
+
+static int finalise_request(struct client *client, struct stream *stream, bool *stream_err) {
+	if (!(stream->req.pseudos.has_path
+		&& stream->req.pseudos.has_method
+		&& stream->req.pseudos.has_scheme)) {
+		*stream_err = true;
+		return HH_ERR_PROTOCOL;
+	}
+
+	// Send headers for request
+	request_send_headers(client, stream);
+	return 0;
 }
 
 static struct stream *update_stream(struct client *client, struct stream *stream, uint32_t stream_id, uint8_t *pri_data,
@@ -306,6 +351,7 @@ static struct stream *update_stream(struct client *client, struct stream *stream
 			exclusive = true;
 		dependency &= ~(1U << 31); // Ignore E bit
 		weight = *(uint8_t *)(pri_data + 4);
+		weight++; // { 0 ... 255 } -> { 1 ... 256 }
 	}
 	// Create new stream if needed
 	if (stream == NULL) {
@@ -327,7 +373,7 @@ static struct stream *update_stream(struct client *client, struct stream *stream
 		}
 	}
 	if (stream->parent == NULL || stream->parent->id != dependency) {
-		struct stream *new_parent = stream_find_id(&client->root_stream, dependency);
+		struct stream *new_parent = streamtab_find_id(&client->streams, dependency);
 		if (new_parent == NULL) {
 			// Create the parent
 			new_parent = stream_alloc();
@@ -335,12 +381,14 @@ static struct stream *update_stream(struct client *client, struct stream *stream
 			new_parent->id = dependency;
 			new_parent->state = HH_STREAM_IDLE;
 			new_parent->window_size = client->settings.initial_window_size;
-			stream_add_child(&client->root_stream, new_parent);
+			stream_add_child(streamtab_root(&client->streams), new_parent);
+			streamtab_insert(&client->streams, new_parent);
 		}
 		if (exclusive)
 			stream_add_exclusive_child(new_parent, stream);
 		else
 			stream_add_child(new_parent, stream);
+		streamtab_insert(&client->streams, stream);
 	}
 	//log_debug("Openened stream %u, weight %u, depends %u", stream_id, stream->weight, dependency);
 	return stream;
@@ -451,7 +499,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 		if (!has_full_frame)
 			continue;
 
-		struct stream *stream = stream_find_id(&client->root_stream, ib->header.stream_id);
+		struct stream *stream = streamtab_find_id(&client->streams, ib->header.stream_id);
 		// Check whether the frame is allowed in this state
 		if (ib->header.stream_id != 0) {
 			int state;
@@ -492,7 +540,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					&& ib->header.type != HH_FT_RST_STREAM) {
 						send_rst_stream(client, ib->header.stream_id, HH_ERR_STREAM_CLOSED);
 						// TODO: Change stream state to closed
-						continue;
+						goto rst_stream;
 					}
 					break;
 				case HH_STREAM_CLOSED:
@@ -536,6 +584,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 						switch (id) {
 							case 1:
 								client->settings.header_table_size = value;
+								hpack_resize(&client->encoder, MIN(value, 65535));
 								break;
 							case 2:
 								if (value != 0 && value != 1) {
@@ -585,8 +634,10 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					if (increment_size == 0) {
 						send_goaway(client, HH_ERR_PROTOCOL);
 						goto goaway;
+					} else if ((client->window_size + increment_size) > ((1U << 31) - 1)) {
+						send_goaway(client, HH_ERR_FLOW_CONTROL);
+						goto goaway;
 					} else
-						// Not realistically going to overflow
 						client->window_size += increment_size;
 				} else {
 					if (stream == NULL || stream->state == HH_STREAM_CLOSED) {
@@ -596,7 +647,11 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 							assert(0); // Shouldn't happen, we catch IDLE state above
 					} else if (increment_size == 0) {
 						send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
+						goto rst_stream;
 						// TODO: Change stream state to closed
+					} else if ((stream->window_size + increment_size) > ((1U << 31) - 1)) {
+						send_rst_stream(client, ib->header.stream_id, HH_ERR_FLOW_CONTROL);
+						goto rst_stream;
 					} else
 						stream->window_size += increment_size;
 				}
@@ -613,7 +668,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				if (stream == NULL) {
 					// Circular dependency
 					send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
-					continue;
+					goto rst_stream;
 				}
 				break;
 			case HH_FT_CONTINUATION:
@@ -662,35 +717,59 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				if (stream == NULL) {
 					// Circular dependency
 					send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
-					continue;
+					goto rst_stream;
 				}
 				struct hpack_decoding dec = {
 					.blk = decode_start,
 					.blk_len = decode_len,
 					.buf = client->hdblock,
 					.buf_len = CLIENT_INITIAL_HDBUF_SIZE,
-					.cb = hpack_decode_event,
+					.cb = NULL,
 					.priv = client,
 					.cut = !(ib->header.flags & HH_HEADERS_END_HEADERS)
 				};
 				int rv;
-				if ((rv = hpack_decode(client->hpack_state, &dec)) < 0) {
-					switch (rv) {
-						case HPACK_RES_BLK: // Partial block
-							break;
-						case HPACK_RES_SKP: // Buffer not large enough, recoverable
-							log_trace();
-							assert(hpack_skip(client->hpack_state) == HPACK_RES_OK);
-							send_rst_stream(client, ib->header.stream_id, HH_ERR_REFUSED_STREAM);
-							continue;
-						case HPACK_RES_BIG: // Buffer not large enough, fatal
-							send_goaway(client, HH_ERR_PROTOCOL);
-							goto goaway;
-						default:
-							log_debug("Call to hpack_decode failed (%s)", hpack_strerror(rv));
-							send_goaway(client, HH_ERR_COMPRESSION);
-							goto goaway;
+				bool stream_err;
+				char *name = NULL, *value = NULL;
+				while ((rv = hpack_decode_fields(client->decoder,
+						&dec, (const char **)&name, (const char **)&value)) == HPACK_RES_FLD) {
+					// Pack the header into the request struct
+					rv = process_header(stream, name, value, &stream_err);
+					if (rv != 0) {
+						if (stream_err) {
+							send_rst_stream(client, ib->header.stream_id, rv);
+							goto rst_stream;
+						} else {
+							send_goaway(client, rv);
+						}
 					}
+				}
+				switch (rv) {
+					case HPACK_RES_BLK: // Decoding not finished
+						break;
+					case HPACK_RES_OK: {// Decoding finished
+						// Finalise request
+						rv = finalise_request(client, stream, &stream_err);
+						if (rv != 0) {
+							if (stream_err) {
+								send_rst_stream(client, ib->header.stream_id, rv);
+								goto rst_stream;
+							} else {
+								send_goaway(client, rv);
+							}
+						}
+						break;
+					} case HPACK_RES_SKP: // Buffer not large enough, recoverable
+						assert(hpack_skip(client->decoder) == HPACK_RES_OK);
+						send_rst_stream(client, ib->header.stream_id, HH_ERR_REFUSED_STREAM);
+						goto rst_stream;
+					case HPACK_RES_BIG: // Buffer not large enough, fatal
+						send_goaway(client, HH_ERR_PROTOCOL);
+						goto goaway;
+					default:
+						//log_debug("Call to hpack_decode failed (%s)", hpack_strerror(rv));
+						send_goaway(client, HH_ERR_COMPRESSION);
+						goto goaway;
 				}
 				stream_change_state(stream, HH_STREAM_OPEN);
 				break;
@@ -728,12 +807,17 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					goto goaway;
 				} else {
 					uint32_t err = ntohl(*(uint32_t *)ib->payload);
+					(void)err;
 					log_debug("RST_STREAM: id %u, err %u", stream->id, err);
 				}
+				break;
+			case HH_FT_DATA:
 				break;
 			default:
 				break;
 		}
+rst_stream:
+		continue;
 	}
 	log_trace();
 	return 0;
@@ -851,7 +935,8 @@ int client_on_write_ready(struct client *client) {
 				change_state(client, HH_WAITING_MAGIC);
 			break;
 		case HH_WAITING_MAGIC:
-			log_trace(); // This shouldn't happen
+			if (client_write_flush(client) < 0)
+				goto error;
 			break;
 		case HH_WAITING_SETTINGS: // Keep sending SETTINGS frame
 		case HH_IDLE:
@@ -860,6 +945,8 @@ int client_on_write_ready(struct client *client) {
 			break;
 		case HH_GOAWAY:
 		case HH_TLS_SHUTDOWN:
+			if (client_write_flush(client) < 0)
+				goto error;
 			break;
 		default:
 #ifdef NDEBUG

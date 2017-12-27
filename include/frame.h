@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <hpack.h>
 
 #define HH_HEADER_SIZE 9
 
@@ -66,3 +67,4 @@ int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code
 int send_goaway(struct client *client, uint32_t err_code);
 int send_ping(struct client *client, uint8_t *data, bool ack);
 int send_settings(struct client *client, struct h2_settings *server_settings, bool ack);
+int send_headers(struct client *client, uint32_t, struct hpack_field *, size_t);

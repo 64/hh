@@ -56,7 +56,6 @@ int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code
 	rst_stream->err_code = htonl(err_code);
 	construct_frame_header(&rst_stream->header, 4, 0, HH_FT_RST_STREAM, stream_id);
 	pqueue_submit_frame(&client->pqueue, node, HH_PRI_MED);
-	client_write_flush(client);
 	return 0;
 }
 
@@ -71,7 +70,6 @@ int send_goaway(struct client *client, uint32_t err_code) {
 	goaway->err_code = htonl(err_code);
 	construct_frame_header(&goaway->header, 8, 0, HH_FT_GOAWAY, 0);
 	pqueue_submit_frame(&client->pqueue, node, HH_PRI_HIGH);
-	client_write_flush(client);
 	return 0;
 }
 
@@ -83,7 +81,6 @@ int send_ping(struct client *client, uint8_t *data, bool ack) {
 	memcpy(ping->data, data, 8);
 	construct_frame_header(&ping->header, 8, ack, HH_FT_PING, 0);
 	pqueue_submit_frame(&client->pqueue, node, HH_PRI_HIGH);
-	client_write_flush(client);
 	return 0;
 }
 
@@ -96,6 +93,48 @@ int send_settings(struct client *client, struct h2_settings *server_settings, bo
 	assert(server_settings == NULL); // Not implemented yet
 	construct_frame_header(&settings->header, 0, ack, HH_FT_SETTINGS, 0);
 	pqueue_submit_frame(&client->pqueue, node, HH_PRI_MED);
-	client_write_flush(client);
+	return 0;
+}
+
+struct tmp_buf {
+	char *data;
+	size_t offset;
+};
+
+static void header_encode_cb(enum hpack_event_e evt, const char *buf, size_t len, void *priv) {
+	struct tmp_buf *out = priv;
+	switch (evt) {
+		case HPACK_EVT_DATA:
+			memcpy(out->data + out->offset, buf, len);
+			out->offset += len;
+			break;
+		default:
+			break;
+	}
+}
+
+#define MAX_HEADERS_BUF 512
+// TODO: Padding etc
+int send_headers(struct client *client, uint32_t stream_id, struct hpack_field *fields, size_t len) {
+	struct pqueue_node *node = pqueue_node_alloc(sizeof(struct frame_header) + MAX_HEADERS_BUF);
+	struct tmp_buf buf = { .data = node->data + sizeof(struct frame_header), .offset = 0 };
+	char hpack_buf[MAX_HEADERS_BUF];
+	struct hpack_encoding enc = {
+		.fld = fields,
+		.fld_cnt = len,
+		.buf = hpack_buf,
+		.buf_len = MAX_HEADERS_BUF,
+		.cb = header_encode_cb,
+		.priv = &buf,
+		.cut = 0
+	};
+	int rv = hpack_encode(client->encoder, &enc);
+	if (rv != HPACK_RES_OK) {
+		log_debug("HPACK encoding failed (%s)", hpack_strerror(rv));
+		return -1;
+	}
+	construct_frame_header((struct frame_header *)node->data, buf.offset,
+				HH_HEADERS_END_HEADERS | HH_HEADERS_END_STREAM, HH_FT_HEADERS, stream_id);
+	pqueue_submit_frame(&client->pqueue, node, HH_PRI_MED);
 	return 0;
 }

@@ -6,6 +6,7 @@
 #include "frame.h"
 #include "pqueue.h"
 #include "stream.h"
+#include "request.h"
 #include "util.h"
 
 #define CLIENT_EPOLL_EVENTS (EPOLLIN | EPOLLET | EPOLLRDHUP)
@@ -38,13 +39,14 @@ struct client {
 	bool is_closing;
 	uint32_t continuation_on_stream;
 	uint32_t highest_stream_seen;
-	uint8_t *hdblock;
+	size_t window_size;
+	uint8_t *hdblock; // Big buffer for header decoding
 	struct ib_frame ib_frame;
 	struct pqueue pqueue;
 	struct h2_settings settings;
-	struct hpack *hpack_state;
-	struct stream root_stream;
-	size_t window_size;
+	struct hpack *encoder;
+	struct hpack *decoder;
+	struct streamtab streams;
 };
 
 void set_thread_state(struct thread_state *);
