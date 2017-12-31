@@ -17,7 +17,7 @@ DEPFILES := $(patsubst %.o,%.d,$(OBJS))
 ifeq ($(HH_DEBUG),1)
   CFLAGS += -Og -g -DLOG_LEVEL=4 -fsanitize=address,undefined
 else
-  CFLAGS += -O2 -DNDEBUG -DLOG_LEVEL=2
+  CFLAGS += -O3 -DNDEBUG -DLOG_LEVEL=2
 endif
 
 all: $(BUILD)/$(EXE) $(BUILD)/$(HPACKER)

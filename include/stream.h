@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <assert.h>
 #include "request.h"
 
 enum stream_state {
@@ -37,6 +38,7 @@ struct streamtab {
 
 void streamtab_alloc(struct streamtab *);
 void streamtab_insert(struct streamtab *, struct stream *);
+struct stream *streamtab_schedule(struct streamtab *);
 struct stream *streamtab_find_id(struct streamtab *, uint32_t);
 void streamtab_free(struct streamtab *);
 
@@ -47,6 +49,8 @@ int stream_change_state(struct stream *stream, enum stream_state new_state);
 void stream_free(struct stream *);
 
 static inline struct stream *streamtab_root(struct streamtab *tab) {
-	return streamtab_find_id(tab, 0);
+	struct stream *s = streamtab_find_id(tab, 0);
+	assert(s != NULL);
+	return s;
 }
 

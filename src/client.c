@@ -6,6 +6,9 @@
 #include <arpa/inet.h>
 #include <sys/timerfd.h>
 #include <sys/epoll.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <assert.h>
@@ -17,6 +20,7 @@
 #define CLIENT_MAGIC "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 #define CLIENT_MAGIC_LEN 24
 #define CLIENT_INITIAL_HDBUF_SIZE (1 << 13)
+#define DATA_BUF_SIZE (1 << 14)
 
 extern struct s2n_config *server_config;
 
@@ -47,7 +51,7 @@ struct client *client_new(int fd, int timer_fd) {
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
 	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
-	s2n_connection_prefer_throughput(rv->tls); // Hope s2n buffers writes well for us
+	s2n_connection_prefer_low_latency(rv->tls); // Hope s2n buffers writes well for us
 	s2n_connection_set_ctx(rv->tls, rv);
 	streamtab_alloc(&rv->streams);
 	rv->highest_stream_seen = 0;
@@ -56,6 +60,7 @@ struct client *client_new(int fd, int timer_fd) {
 	rv->fd = fd;
 	rv->timer_fd = timer_fd;
 	rv->state = HH_NEGOTIATING_TLS;
+	rv->end_stream = false;
 	rv->is_closing = false;
 	rv->is_write_blocked = false;
 	rv->blocked = S2N_NOT_BLOCKED;
@@ -75,7 +80,6 @@ cleanup:
 
 void client_free(struct client *client) {
 	// TODO: Wipe the connection, don't free it
-	s2n_connection_wipe(client->tls);
 	s2n_connection_free(client->tls);
 	pqueue_free(&client->pqueue);
 	streamtab_free(&client->streams);
@@ -114,9 +118,9 @@ int client_close_graceful(struct client *client) {
 	assert(client->is_closing);
 	if (client->state == HH_GOAWAY) {
 		// Wait until the GOAWAY frame has been sent
-		if (client->pqueue.high_pri == NULL)
+		if (client->pqueue.high_pri == NULL) {
 			change_state(client, HH_TLS_SHUTDOWN);
-		else
+		} else
 			return 0;
 	}
 	if (client->state == HH_TLS_SHUTDOWN) {
@@ -124,10 +128,13 @@ int client_close_graceful(struct client *client) {
 			switch(s2n_error_get_type(s2n_errno)) {
 				case S2N_ERR_T_BLOCKED:
 					return 0;
+				case S2N_ERR_T_CLOSED:
+					return -1;
 				case S2N_ERR_T_IO:
-					log_debug("Call to s2n_shutdown failed (%s)", strerror(errno));
+					log_debug("Call to s2n_shutdown failed IO (%s)", strerror(errno));
 					return -1;
 				default:
+					//log_debug("Call to s2n_shutdown failed (%s)", s2n_strerror(s2n_errno, "EN"));
 					return -1;
 			}
 		}
@@ -138,10 +145,7 @@ int client_close_graceful(struct client *client) {
 
 // Big state machine.
 static int change_state(struct client *client, enum client_state to) {
-	if (to == HH_BLINDED) {
-		client->state = to;
-		return 0;
-	} else if (to == HH_ALREADY_CLOSED) {
+	if (to == HH_BLINDED || to == HH_ALREADY_CLOSED) {
 		client->state = to;
 		return 0;
 	}
@@ -190,11 +194,10 @@ static int change_state(struct client *client, enum client_state to) {
 			}
 			break;
 		case HH_GOAWAY:
-			switch (to) {
+			switch (to) {	
 				case HH_TLS_SHUTDOWN:
 					client->state = to;
 					break;
-				case HH_GOAWAY:
 				default:
 					goto verybad;
 			}
@@ -300,13 +303,16 @@ static int process_header(struct stream *stream, char *name, char *value, bool *
 		} else if (*value != '/') {
 			*stream_err = true;
 			return HH_ERR_PROTOCOL;
-		} else
+		} else {
 			stream->req.pseudos.has_path = true;
+			strncpy(stream->req.pathbuf, value, REQ_MAX_PATH - 1);
+			stream->req.pathbuf[REQ_MAX_PATH - 1] = '\0';
+		}
 	} else if (strcmp(name, ":method") == 0) {
 		if (stream->req.pseudos.has_method) {
 			*stream_err = true;
 			return HH_ERR_PROTOCOL;
-		} else
+		} else // TODO: Don't respond to requests other than GET
 			stream->req.pseudos.has_method = true;
 	} else if (strcmp(name, ":scheme") == 0) {
 		if (stream->req.pseudos.has_scheme) {
@@ -333,6 +339,27 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 		*stream_err = true;
 		return HH_ERR_PROTOCOL;
 	}
+
+	if (strcmp(stream->req.pathbuf, "/") == 0)
+		strcat(stream->req.pathbuf, "index.html");
+
+	char pathbuf[2 * REQ_MAX_PATH] = { 0 };
+	strcpy(pathbuf, "data/static");
+	strcat(pathbuf, stream->req.pathbuf); // Won't overflow since we terminated it at REQ_MAX_PATH - 1
+
+	log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
+	stream->req.pathptr = &pathbuf[0];
+	// Prevent directory traversal attacks
+	if (strstr(stream->req.pathbuf, "../") != NULL) {
+		stream->req.status_code = 400;
+	} else if ((stream->req.fd = open(pathbuf, O_RDONLY)) == -1) {
+		if (errno == ENOENT)
+			stream->req.status_code = 404;
+		else
+			stream->req.status_code = 500;
+	} else
+		stream->req.status_code = 200;
+	assert(stream->req.status_code == 200 || stream->req.fd == -1);
 
 	// Send headers for request
 	request_send_headers(client, stream);
@@ -361,17 +388,16 @@ static struct stream *update_stream(struct client *client, struct stream *stream
 		stream->window_size = client->settings.initial_window_size;
 		stream->state = state_if_created;
 	}
-	// If parent is null, we just created stream
 	if (dependency == stream_id) {
-		stream_free(stream);
 		return NULL;
 	}
 	if (stream->id > client->highest_stream_seen) {
-		client->highest_stream_seen = stream->id;
 		if (state_if_created == HH_STREAM_OPEN) {
+			client->highest_stream_seen = stream->id;
 			// TODO: Close all idle streams <= stream->id
 		}
 	}
+	// If parent is null, we just created stream
 	if (stream->parent == NULL || stream->parent->id != dependency) {
 		struct stream *new_parent = streamtab_find_id(&client->streams, dependency);
 		if (new_parent == NULL) {
@@ -672,7 +698,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				break;
 			case HH_FT_CONTINUATION:
-				if (stream == NULL || (ib->header.flags & (HH_PADDED | HH_PRIORITY)) != 0) {
+				if (stream == NULL || (ib->header.flags & (HH_END_STREAM | HH_PADDED | HH_PRIORITY)) != 0) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
 				}
@@ -694,6 +720,9 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				client->continuation_on_stream =
 					(ib->header.flags & HH_HEADERS_END_HEADERS) == 0 ? ib->header.stream_id : 0;
+				if (ib->header.type == HH_FT_HEADERS)
+					client->end_stream = (ib->header.flags & HH_END_STREAM) == HH_END_STREAM;
+				//assert(client->continuation_on_stream != 0 || client->end_stream);
 				if (ib->header.flags & HH_PADDED) {
 					uint8_t pad_len = *(uint8_t *)ib->payload;
 					if (pad_len >= ib->header.length) {
@@ -712,7 +741,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					decode_len -= 5;
 					decode_start += 5;
 				}
-				// TODO: Check for END_STREAM
 				stream = update_stream(client, stream, ib->header.stream_id, new_stream_pri_info, HH_STREAM_OPEN);
 				if (stream == NULL) {
 					// Circular dependency
@@ -749,6 +777,10 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 						break;
 					case HPACK_RES_OK: {// Decoding finished
 						// Finalise request
+						if (client->end_stream) {
+							stream_change_state(stream, HH_STREAM_HCLOSED_REMOTE);
+							client->end_stream = false;
+						}
 						rv = finalise_request(client, stream, &stream_err);
 						if (rv != 0) {
 							if (stream_err) {
@@ -771,7 +803,6 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 						send_goaway(client, HH_ERR_COMPRESSION);
 						goto goaway;
 				}
-				stream_change_state(stream, HH_STREAM_OPEN);
 				break;
 			} case HH_FT_PING:
 				if (ib->header.length != 8) {
@@ -807,8 +838,9 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					goto goaway;
 				} else {
 					uint32_t err = ntohl(*(uint32_t *)ib->payload);
-					(void)err;
 					log_debug("RST_STREAM: id %u, err %u", stream->id, err);
+					(void)err;
+					stream_change_state(stream, HH_STREAM_CLOSED);
 				}
 				break;
 			case HH_FT_DATA:
@@ -875,19 +907,39 @@ static int signal_epollout(struct client *client, bool on) {
 	return 0;
 }
 
+bool client_pending_write(struct client *client) {
+	return (pqueue_is_data_pending(&client->pqueue)) || (streamtab_schedule(&client->streams) != NULL);
+}
+
 int client_write_flush(struct client *client) {
+	assert(!client->is_closing || client->state == HH_GOAWAY);
 	struct pqueue_node *out;
+	char buf[DATA_BUF_SIZE];
 	do {
 		// Write the highest priority data first
 		size_t out_len;
 		char *out_data;
 		pqueue_pop_next(&client->pqueue, &out, &out_data, &out_len);
-		if (out == NULL)
-			return 0; // Nothing else to write
 
 		// If we're in the GOAWAY state, stop writing if not high priority
-		if (out != client->pqueue.high_pri && client->state == HH_GOAWAY) {
+		if (client->state == HH_GOAWAY && (out != client->pqueue.high_pri || out == NULL)) {
 			return 0;
+		}
+
+		// Check if we have any DATA frames to write
+		if (out == NULL) {
+			// Nothing to write - fulfil a request by sending DATA
+			// TODO: Implement flow control
+			struct stream *s = streamtab_schedule(&client->streams);
+			if (s == NULL) // Otherwise, we have nothing to write
+				return 0;
+			size_t size_requested = DATA_BUF_SIZE;
+			if (request_fulfill(s, (uint8_t *)buf, &size_requested) < 0) {
+				// TODO: Send RST_STREAM
+				return -1;
+			}
+			out_data = buf;
+			out_len = size_requested;
 		}
 
 		ssize_t nwritten;
@@ -896,6 +948,7 @@ int client_write_flush(struct client *client) {
 		if (nwritten < 0) {
 			switch (s2n_error_get_type(s2n_errno)) {
 				case S2N_ERR_T_CLOSED:
+					change_state(client, HH_ALREADY_CLOSED);
 					return -1;
 				case S2N_ERR_T_BLOCKED:
 					break;
@@ -906,16 +959,33 @@ int client_write_flush(struct client *client) {
 					return blind_client(client, s2n_connection_get_delay(client->tls));
 			}
 		} else {
-			pqueue_report_write(&client->pqueue, out, nwritten);
+			if (out_data == buf) {
+				// A DATA frame was sent
+				// Malloc and push onto write queue for later
+				size_t remaining = out_len - nwritten;
+				if (remaining == 0)
+					out = NULL;
+				else {
+					log_trace();
+					// TODO: Don't copy the whole 16k here if possible
+					out = pqueue_node_alloc(remaining);
+					memcpy(out->data, buf, out_len);
+					out->nwritten = nwritten;
+					pqueue_submit_frame(&client->pqueue, out, HH_PRI_LOW);
+				}
+			}
+			if (out != NULL)
+				pqueue_report_write(&client->pqueue, out, nwritten);
 		}
 	} while (client->blocked == S2N_NOT_BLOCKED);
 
-	// We still have data remaining, signal EPOLLOUT
-	if (out != NULL && !client->is_write_blocked) {
+	// If we still have data remaining, signal EPOLLOUT
+	bool pending = client_pending_write(client);
+	if (pending && !client->is_write_blocked) {
 		client->is_write_blocked = true;
 		if (signal_epollout(client, true) < 0)
 			return -1;
-	} else if (out == NULL && client->is_write_blocked) {
+	} else if (!pending && client->is_write_blocked) {
 		// All data is now written, clear EPOLLOUT
 		client->is_write_blocked = false;
 		if (signal_epollout(client, false) < 0)
@@ -934,19 +1004,18 @@ int client_on_write_ready(struct client *client) {
 			if (client->blocked == S2N_NOT_BLOCKED)
 				change_state(client, HH_WAITING_MAGIC);
 			break;
-		case HH_WAITING_MAGIC:
-			if (client_write_flush(client) < 0)
-				goto error;
-			break;
 		case HH_WAITING_SETTINGS: // Keep sending SETTINGS frame
 		case HH_IDLE:
 			if (client_write_flush(client) < 0)
 				goto graceful_exit;
 			break;
+		case HH_WAITING_MAGIC:
 		case HH_GOAWAY:
-		case HH_TLS_SHUTDOWN:
 			if (client_write_flush(client) < 0)
 				goto error;
+			break;
+		case HH_TLS_SHUTDOWN:
+		case HH_ALREADY_CLOSED:
 			break;
 		default:
 #ifdef NDEBUG
@@ -986,6 +1055,7 @@ int client_on_data_received(struct client *client) {
 			break;
 		case HH_GOAWAY:
 		case HH_TLS_SHUTDOWN:
+			// Ignore it
 			break;
 		default:
 #ifdef NDEBUG

@@ -35,8 +35,8 @@ static int signal_fd, fd_queue[MAX_FD_QUEUE];
 
 static pthread_mutex_t fd_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static const char *certificate_path = "test/cert.pem";
-static const char *pkey_path = "test/pkey.pem";
+static const char *certificate_path = "data/cert.pem";
+static const char *pkey_path = "data/pkey.pem";
 
 struct s2n_config *server_config;
 
@@ -164,6 +164,7 @@ static void consume_available_fd(int epoll_fd) {
 		struct epoll_event event;
 		event.data.ptr = client_new(new_fd, timer_fd); // Might fail due to mlock limits
 		if (event.data.ptr == NULL) {
+			log_warn("Call to client_new failed");
 			close(new_fd);
 			close(timer_fd);
 			return;
@@ -171,7 +172,8 @@ static void consume_available_fd(int epoll_fd) {
 
 		event.events = CLIENT_EPOLL_EVENTS;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &event) == -1) {
-			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
+			log_warn("FD: %d", new_fd);
+			log_warn("Call to epoll_ctl on socket fd failed (%s)", strerror(errno));
 			client_free(event.data.ptr);
 			return;
 		}
@@ -182,7 +184,8 @@ static void consume_available_fd(int epoll_fd) {
 		event.data.ptr = (void *)((uintptr_t)event.data.ptr + 1);
 		event.events = EPOLLIN | EPOLLET;
 		if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &event) == -1) {
-			log_warn("Call to epoll_ctl failed (%s)", strerror(errno));
+			log_warn("FD: %d", timer_fd);
+			log_warn("Call to epoll_ctl on timer fd failed (%s)", strerror(errno));
 			client_free(event.data.ptr);
 			return;
 		}
@@ -302,7 +305,7 @@ static void *worker_event_loop(void *state) {
 					continue; // Client has been immediately closed
 				}
 			}
-			if (events[i].events & EPOLLOUT || pqueue_is_data_pending(&client->pqueue)) {
+			if (events[i].events & EPOLLOUT || client_pending_write(client)) {
 				if (client_on_write_ready(client) < 0) {
 					continue; // Client has been immediately closed
 				}

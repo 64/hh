@@ -22,8 +22,8 @@
 // Frame flags
 #define HH_SETTINGS_ACK 1
 #define HH_PING_ACK 1
-#define HH_HEADERS_END_STREAM 1
 #define HH_HEADERS_END_HEADERS 4
+#define HH_END_STREAM 1
 #define HH_PADDED 8
 #define HH_PRIORITY 32
 
@@ -60,11 +60,16 @@ struct ib_frame {
 	} state;
 };
 
+struct frame_header {
+	uint8_t data[HH_HEADER_SIZE];
+} __attribute__((packed));
+
 struct client;
 struct h2_settings;
 
+void construct_frame_header(struct frame_header *hd, uint32_t length, uint8_t flags, uint8_t type, uint32_t stream_id);
 int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code);
 int send_goaway(struct client *client, uint32_t err_code);
 int send_ping(struct client *client, uint8_t *data, bool ack);
 int send_settings(struct client *client, struct h2_settings *server_settings, bool ack);
-int send_headers(struct client *client, uint32_t, struct hpack_field *, size_t);
+int send_headers(struct client *client, uint32_t stream_id, struct hpack_field *fields, size_t len, bool end_stream);

@@ -37,6 +37,7 @@ struct client {
 	s2n_blocked_status blocked;
 	bool is_write_blocked;
 	bool is_closing;
+	bool end_stream;
 	uint32_t continuation_on_stream;
 	uint32_t highest_stream_seen;
 	size_t window_size;
@@ -53,6 +54,7 @@ void set_thread_state(struct thread_state *);
 struct client *client_new(int, int);
 void client_free(struct client *);
 int client_write_flush(struct client *);
+bool client_pending_write(struct client *);
 void client_close_immediate(struct client *);
 int client_close_graceful(struct client *);
 

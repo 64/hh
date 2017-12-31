@@ -8,10 +8,6 @@
 #include "log.h"
 #include "pqueue.h"
 
-struct frame_header {
-	uint8_t data[HH_HEADER_SIZE];
-} __attribute__((packed));
-
 struct frame_goaway {
 	struct frame_header header;
 	uint32_t last_stream;
@@ -36,9 +32,9 @@ struct frame_ping {
 	uint8_t data[8];
 } __attribute__((packed));
 
-static void construct_frame_header(struct frame_header *hd, uint32_t length, uint8_t flags, uint8_t type, uint32_t stream_id) {
+void construct_frame_header(struct frame_header *hd, uint32_t length, uint8_t flags, uint8_t type, uint32_t stream_id) {
 	hd->data[2] = length & 0xFF;
-	hd->data[1] = (length >> 9) & 0xFF;
+	hd->data[1] = (length >> 8) & 0xFF;
 	hd->data[0] = (length >> 16) & 0xFF;
 	hd->data[3] = type;
 	hd->data[4] = flags;
@@ -115,7 +111,7 @@ static void header_encode_cb(enum hpack_event_e evt, const char *buf, size_t len
 
 #define MAX_HEADERS_BUF 512
 // TODO: Padding etc
-int send_headers(struct client *client, uint32_t stream_id, struct hpack_field *fields, size_t len) {
+int send_headers(struct client *client, uint32_t stream_id, struct hpack_field *fields, size_t len, bool end_stream) {
 	struct pqueue_node *node = pqueue_node_alloc(sizeof(struct frame_header) + MAX_HEADERS_BUF);
 	struct tmp_buf buf = { .data = node->data + sizeof(struct frame_header), .offset = 0 };
 	char hpack_buf[MAX_HEADERS_BUF];
@@ -134,7 +130,8 @@ int send_headers(struct client *client, uint32_t stream_id, struct hpack_field *
 		return -1;
 	}
 	construct_frame_header((struct frame_header *)node->data, buf.offset,
-				HH_HEADERS_END_HEADERS | HH_HEADERS_END_STREAM, HH_FT_HEADERS, stream_id);
+				HH_HEADERS_END_HEADERS | (end_stream ? HH_END_STREAM : 0), 
+				HH_FT_HEADERS, stream_id);
 	pqueue_submit_frame(&client->pqueue, node, HH_PRI_MED);
 	return 0;
 }
