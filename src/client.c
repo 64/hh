@@ -20,7 +20,7 @@
 #define CLIENT_MAGIC "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 #define CLIENT_MAGIC_LEN 24
 #define CLIENT_INITIAL_HDBUF_SIZE (1 << 13)
-#define DATA_BUF_SIZE (1 << 14)
+#define DATA_BUF_SIZE ((1 << 14) + HH_HEADER_SIZE)
 
 extern struct s2n_config *server_config;
 
@@ -817,8 +817,13 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 				}
 				break;
 			case HH_FT_GOAWAY:
-				/*if (ib->header.length >= 8)
-					log_debug("Received GOAWAY with code %u", ntohl(*(uint32_t *)&ib->payload[4]));*/
+#ifndef NDEBUG
+				if (ib->header.length >= 8)
+					log_debug("Received GOAWAY (%d): %.*s",
+							ntohl(*(uint32_t *)&ib->payload[4]),
+							ib->header.length - 8,
+							&ib->payload[8]);
+#endif
 				return -1; // Shutdown gracefully now
 				break;
 			case HH_FT_RST_STREAM:
@@ -966,7 +971,6 @@ int client_write_flush(struct client *client) {
 				if (remaining == 0)
 					out = NULL;
 				else {
-					log_trace();
 					// TODO: Don't copy the whole 16k here if possible
 					out = pqueue_node_alloc(out_len);
 					memcpy(out->data, buf, out_len);

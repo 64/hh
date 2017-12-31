@@ -139,6 +139,7 @@ int pqueue_report_write(struct pqueue *pqueue, struct pqueue_node *frame, size_t
 		struct pqueue_node *tmp = frame->next;
 		pqueue_node_free(frame);
 		*origin = tmp;
+		pqueue->write_head = HH_PRI_NONE; // Free up the other queues for writing
 	} else
 		pqueue->write_head = pri;
 	return 0;
