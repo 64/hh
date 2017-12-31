@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <hpack.h>
+#include "cashpack.h"
 
 #define HH_HEADER_SIZE 9
 

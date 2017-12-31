@@ -1,4 +1,3 @@
-#include <hpack.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <stdint.h>
@@ -8,6 +7,7 @@
 
 #include "request.h"
 #include "stream.h"
+#include "cashpack.h"
 #include "frame.h"
 #include "log.h"
 

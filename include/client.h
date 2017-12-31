@@ -1,12 +1,12 @@
 #pragma once
 #include <s2n.h>
-#include <hpack.h>
 #include <stdbool.h>
 
 #include "frame.h"
 #include "pqueue.h"
 #include "stream.h"
 #include "request.h"
+#include "cashpack.h"
 #include "util.h"
 
 #define CLIENT_EPOLL_EVENTS (EPOLLIN | EPOLLET | EPOLLRDHUP)

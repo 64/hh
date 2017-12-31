@@ -968,7 +968,7 @@ int client_write_flush(struct client *client) {
 				else {
 					log_trace();
 					// TODO: Don't copy the whole 16k here if possible
-					out = pqueue_node_alloc(remaining);
+					out = pqueue_node_alloc(out_len);
 					memcpy(out->data, buf, out_len);
 					out->nwritten = nwritten;
 					pqueue_submit_frame(&client->pqueue, out, HH_PRI_LOW);
