@@ -974,7 +974,6 @@ int client_write_flush(struct client *client) {
 					// TODO: Don't copy the whole 16k here if possible
 					out = pqueue_node_alloc(out_len);
 					memcpy(out->data, buf, out_len);
-					out->nwritten = nwritten;
 					pqueue_submit_frame(&client->pqueue, out, HH_PRI_LOW);
 				}
 			}
@@ -1058,6 +1057,7 @@ int client_on_data_received(struct client *client) {
 				goto graceful_exit;
 			break;
 		case HH_GOAWAY:
+			// TODO: Check s2n_recv for EOF
 		case HH_TLS_SHUTDOWN:
 			// Ignore it
 			break;
