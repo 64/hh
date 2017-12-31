@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "request.h"
@@ -21,6 +23,7 @@
 // TODO: Better allocation
 void request_send_headers(struct client *client, struct stream *stream) {
 	struct hpack_field fields[MAX_HEADER_FIELDS];
+	char content_length[10] = { 0 };
 	size_t pos = 0;
 	bool end_stream = false;
 
@@ -56,6 +59,16 @@ void request_send_headers(struct client *client, struct stream *stream) {
 				else if (strcmp(extension, "jpg") == 0)
 					HEADER("content-type", "image/jpg");
 			}
+
+			struct stat statbuf;
+			if (fstat(stream->req.fd, &statbuf) < 0) {
+				log_warn("Call to fstat failed (%s)", strerror(errno));
+			} else {
+				log_debug("Stat size: %zu", statbuf.st_size);
+				snprintf(content_length, 10, "%zu", statbuf.st_size);
+				HEADER("content-length", content_length);
+			}
+
 			break;
 		default:
 			log_trace();
