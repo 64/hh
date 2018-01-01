@@ -118,7 +118,8 @@ int pqueue_pop_next(struct pqueue *pqueue, struct pqueue_node **out_frame, char 
 int pqueue_report_write(struct pqueue *pqueue, struct pqueue_node *frame, size_t len_written) {
 	struct pqueue_node **origin;
 	enum pqueue_pri pri;
-	assert(len_written != 0);
+	if (len_written == 0)
+		return 0;
 	if (frame == pqueue->high_pri) {
 		origin = &pqueue->high_pri;
 		pri = HH_PRI_HIGH;

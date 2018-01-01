@@ -878,7 +878,7 @@ static int do_read(struct client *client) {
 					rv = blind_client(client, s2n_connection_get_delay(client->tls));
 					goto loop_end;
 				default:
-					log_warn("s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
+					log_warn("s2n_recv: %s", s2n_strerror(s2n_errno, "EN"));
 					rv = blind_client(client, s2n_connection_get_delay(client->tls));
 					goto loop_end;
 			}
@@ -952,30 +952,30 @@ int client_write_flush(struct client *client) {
 					change_state(client, HH_ALREADY_CLOSED);
 					return -1;
 				case S2N_ERR_T_BLOCKED:
+					nwritten = 0;
 					break;
 				case S2N_ERR_T_IO:
 					return blind_client(client, s2n_connection_get_delay(client->tls));
 				default:
-					log_warn("s2n_recv: %s\n", s2n_strerror(s2n_errno, "EN"));
+					log_warn("s2n_send: %s", s2n_strerror(s2n_errno, "EN"));
 					return blind_client(client, s2n_connection_get_delay(client->tls));
 			}
-		} else {
-			if (out_data == buf) {
-				// A DATA frame was sent
-				// Malloc and push onto write queue for later
-				size_t remaining = out_len - nwritten;
-				if (remaining == 0)
-					out = NULL;
-				else {
-					// TODO: Don't copy the whole 16k here if possible
-					out = pqueue_node_alloc(out_len);
-					memcpy(out->data, buf, out_len);
-					pqueue_submit_frame(&client->pqueue, out, HH_PRI_LOW);
-				}
+		} 
+		if (out_data == buf) {
+			// A DATA frame was sent
+			// Malloc and push onto write queue for later
+			size_t remaining = out_len - nwritten;
+			if (remaining == 0)
+				out = NULL;
+			else {
+				// TODO: Don't copy the whole 16k here if possible
+				out = pqueue_node_alloc(out_len);
+				memcpy(out->data, buf, out_len);
+				pqueue_submit_frame(&client->pqueue, out, HH_PRI_LOW);
 			}
-			if (out != NULL)
-				pqueue_report_write(&client->pqueue, out, nwritten);
 		}
+		if (out != NULL)
+			pqueue_report_write(&client->pqueue, out, nwritten);
 	} while (client->blocked == S2N_NOT_BLOCKED);
 
 	// If we still have data remaining, signal EPOLLOUT

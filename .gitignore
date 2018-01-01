@@ -5,6 +5,7 @@ vgcore.*
 data/*.pem
 replay.json
 massif.*
+callgrind.*
 
 # Prerequisites
 *.d

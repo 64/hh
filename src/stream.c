@@ -95,6 +95,7 @@ void stream_add_child(struct stream *stream, struct stream *child) {
 	if (stream->children == NULL) {
 		stream->children = child;
 	} else {
+		// TODO: Make this O(1) since it's a bit of a bottleneck
 		struct stream *start = stream->children;
 		while (start->siblings != NULL)
 			start = start->siblings;
