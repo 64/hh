@@ -42,6 +42,7 @@ void request_send_headers(struct client *client, struct stream *stream) {
 			break;
 		case 200:
 			HEADER(":status", "200");
+			HEADER("cache-control", "public");
 			// Set content-type depending on file extension
 			char *extension = strrchr(stream->req.pathptr, '.');
 			if (extension == NULL) {
@@ -64,7 +65,6 @@ void request_send_headers(struct client *client, struct stream *stream) {
 			if (fstat(stream->req.fd, &statbuf) < 0) {
 				log_warn("Call to fstat failed (%s)", strerror(errno));
 			} else {
-				log_debug("Stat size: %zu", statbuf.st_size);
 				snprintf(content_length, 10, "%zu", statbuf.st_size);
 				HEADER("content-length", content_length);
 			}

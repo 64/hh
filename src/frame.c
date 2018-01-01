@@ -38,10 +38,10 @@ void construct_frame_header(struct frame_header *hd, uint32_t length, uint8_t fl
 	hd->data[0] = (length >> 16) & 0xFF;
 	hd->data[3] = type;
 	hd->data[4] = flags;
-	hd->data[8] = stream_id & 0x7F;
+	hd->data[8] = stream_id & 0xFF;
 	hd->data[7] = (stream_id >> 8) & 0xFF;
 	hd->data[6] = (stream_id >> 16) & 0xFF;
-	hd->data[5] = (stream_id >> 24) & 0xFF;
+	hd->data[5] = (stream_id >> 24) & 0x7F;
 }
 
 int send_rst_stream(struct client *client, uint32_t stream_id, uint32_t err_code) {

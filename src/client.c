@@ -355,6 +355,8 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 	} else if ((stream->req.fd = open(pathbuf, O_RDONLY)) == -1) {
 		if (errno == ENOENT)
 			stream->req.status_code = 404;
+		else if (errno == EPERM)
+			stream->req.status_code = 400;
 		else
 			stream->req.status_code = 500;
 	} else
@@ -531,10 +533,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 			int state;
 			if (stream != NULL)
 				state = stream->state;
-			// It's not in the dependency tree, so it must be already closed or not opened
-			else if (ib->header.stream_id <= client->highest_stream_seen)
-				state = HH_STREAM_CLOSED;
-			else
+			else // Not in the dependency tree, so must be not used already
 				state = HH_STREAM_IDLE;
 			switch (state) {
 				case HH_STREAM_IDLE:
@@ -570,7 +569,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					}
 					break;
 				case HH_STREAM_CLOSED:
-					// Technically not standards compliant here. See 5.1@"closed"
+					// TODO: Technically not standards compliant here. See 5.1@"closed"
 					if (ib->header.type != HH_FT_WINDOW_UPDATE
 					&& ib->header.type != HH_FT_PRIORITY
 					&& ib->header.type != HH_FT_RST_STREAM) {
@@ -666,11 +665,8 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					} else
 						client->window_size += increment_size;
 				} else {
-					if (stream == NULL || stream->state == HH_STREAM_CLOSED) {
-						if (ib->header.stream_id <= client->highest_stream_seen)
-							; // It's closed so ignore it
-						else
-							assert(0); // Shouldn't happen, we catch IDLE state above
+					if (stream->state == HH_STREAM_CLOSED) {
+						assert(stream != NULL);
 					} else if (increment_size == 0) {
 						send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
 						goto rst_stream;
