@@ -75,6 +75,11 @@ void request_send_headers(struct client *client, struct stream *stream) {
 			//__builtin_unreachable();
 	}
 
+	if (stream->id == 1) {
+		// This is the first request the client is sending
+		HEADER("strict-transport-security", "max-age=31536000");
+	}
+
 	assert(pos < MAX_HEADER_FIELDS);
 
 	if (end_stream)
@@ -108,11 +113,9 @@ int request_fulfill(struct stream *s, uint8_t *buf, size_t *max_size) {
 		// Will automagically go to HH_STREAM_CLOSED if already in HH_STREAM_HCLOSED_REMOTE
 		stream_change_state(s, HH_STREAM_HCLOSED_LOCAL);
 		flags |= HH_END_STREAM;
-		int rv = close(s->req.fd);
 		s->req.state = HH_REQ_DONE;
-		if (rv != 0) {
+		if (close(s->req.fd) != 0)
 			log_warn("Call to close failed (%s)", strerror(errno));
-		}
 		s->req.fd = -1;
 	} else if (nwritten < 0) {
 		log_warn("Call to read failed (%s)", strerror(errno));

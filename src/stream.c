@@ -96,10 +96,13 @@ void stream_add_child(struct stream *stream, struct stream *child) {
 		stream->children = child;
 	} else {
 		// TODO: Make this O(1) since it's a bit of a bottleneck
-		struct stream *start = stream->children;
-		while (start->siblings != NULL)
-			start = start->siblings;
-		start->siblings = child;
+		struct stream *start = child->children;
+		if (start != NULL) {
+			while (start->siblings != NULL)
+				start = start->siblings;
+			start->siblings = stream->siblings;
+		}
+		stream->siblings = child;
 	}
 }
 

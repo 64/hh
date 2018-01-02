@@ -84,6 +84,7 @@ static int load_server_cert(void) {
 		return -1;
 	}
 
+	// TODO: Don't leak on early return
 	// Read certificate file into buffer
 	fseek(cert_file, 0, SEEK_END);
 	long cert_size = ftell(cert_file);
@@ -426,6 +427,7 @@ static int server_listen(int server_fd, unsigned short port) {
 		state->epoll_fd = -1;
 		if ((errno = pthread_create(&worker_threads[i], NULL, worker_event_loop, state)) != 0) {
 			log_fatal("Call to pthread_create failed (%s)", strerror(errno));
+			free(event_fds);
 			return -1;
 		}
 	}

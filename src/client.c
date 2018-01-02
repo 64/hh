@@ -347,7 +347,7 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 	strcpy(pathbuf, "data/static");
 	strcat(pathbuf, stream->req.pathbuf); // Won't overflow since we terminated it at REQ_MAX_PATH - 1
 
-	log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
+	//log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
 	stream->req.pathptr = &pathbuf[0];
 	// Prevent directory traversal attacks
 	if (strstr(stream->req.pathbuf, "../") != NULL) {
@@ -888,7 +888,7 @@ static int do_read(struct client *client) {
 			rv = -1;
 			goto loop_end;
 		} else {
-			if (parse_frame(client, recv_buffer, nread) < 0) {
+			if (client->state != HH_GOAWAY && parse_frame(client, recv_buffer, nread) < 0) {
 				rv = -1;
 				goto loop_end;
 			}
@@ -1052,9 +1052,12 @@ int client_on_data_received(struct client *client) {
 			if (do_read(client) < 0)
 				goto graceful_exit;
 			break;
-		case HH_GOAWAY:
+		case HH_GOAWAY: {
 			// TODO: Check s2n_recv for EOF
-		case HH_TLS_SHUTDOWN:
+			if (do_read(client) < 0)
+				goto graceful_exit;
+			break;
+		} case HH_TLS_SHUTDOWN:
 			// Ignore it
 			break;
 		default:
