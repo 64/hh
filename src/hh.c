@@ -28,7 +28,9 @@
 #define DEFAULT_PORT 8000
 #define MAX_EVENTS 64
 #define MAX_FD_QUEUE 256
-#define WORKER_THREADS 3
+#ifndef WORKER_THREADS
+#define WORKER_THREADS 4
+#endif
 
 static volatile int fd_queue_head, fd_queue_tail;
 static int signal_fd, fd_queue[MAX_FD_QUEUE];
