@@ -74,11 +74,6 @@ void request_send_headers(struct client *client, struct stream *stream) {
 			//__builtin_unreachable();
 	}
 
-	if (stream->id == 1) {
-		// This is the first request the client is sending
-		HEADER("strict-transport-security", "max-age=31536000");
-	}
-
 	assert(pos < MAX_HEADER_FIELDS);
 
 	if (end_stream)
