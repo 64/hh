@@ -42,7 +42,6 @@ void request_send_headers(struct client *client, struct stream *stream) {
 			break;
 		case 200:
 			HEADER(":status", "200");
-			HEADER("cache-control", "public");
 			// Set content-type depending on file extension
 			char *extension = strrchr(stream->req.pathptr, '.');
 			if (extension == NULL) {

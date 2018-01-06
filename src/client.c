@@ -51,8 +51,8 @@ struct client *client_new(int fd, int timer_fd) {
 	s2n_connection_set_fd(rv->tls, fd);
 	s2n_connection_set_config(rv->tls, server_config);
 	s2n_connection_set_blinding(rv->tls, S2N_SELF_SERVICE_BLINDING);
-	s2n_connection_prefer_low_latency(rv->tls); // Hope s2n buffers writes well for us
-	s2n_connection_set_ctx(rv->tls, rv);
+	s2n_connection_prefer_low_latency(rv->tls);
+	s2n_set_server_name(rv->tls, "mattst.me");
 	streamtab_alloc(&rv->streams);
 	rv->highest_stream_seen = 0;
 	rv->continuation_on_stream = 0;
