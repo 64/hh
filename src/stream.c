@@ -120,7 +120,7 @@ void stream_add_exclusive_child(struct stream *stream, struct stream *child) {
 
 int stream_change_state(struct stream *stream, enum stream_state new_state) {
 	assert(stream->id != 0);
-	
+
 	if (new_state == HH_STREAM_CLOSED && stream->req.state == HH_REQ_IN_PROGRESS) {
 		stream->req.state = HH_REQ_DONE;
 		request_cleanup(&stream->req);
