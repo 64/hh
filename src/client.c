@@ -305,7 +305,11 @@ static int process_header(struct stream *stream, char *name, char *value, bool *
 			return HH_ERR_PROTOCOL;
 		} else {
 			stream->req.pseudos.has_path = true;
-			strncpy(stream->req.pathbuf, value, REQ_MAX_PATH - 1);
+			// Dangerously copy everything up until a questionmark
+			char *src = value, *dst = stream->req.pathbuf;
+			while (*src && *src != '?' && src - value < REQ_MAX_PATH) // TODO: Should it be REQ_MAX_PATH - 1?
+				*dst++ = *src++;
+			*dst = '\0';
 			stream->req.pathbuf[REQ_MAX_PATH - 1] = '\0';
 		}
 	} else if (strcmp(name, ":method") == 0) {
