@@ -56,8 +56,11 @@ void request_send_headers(struct client *client, struct stream *stream) {
 					HEADER("content-type", "text/css");
 				else if (strcmp(extension, "png") == 0)
 					HEADER("content-type", "image/png");
-				else if (strcmp(extension, "jpg") == 0)
+				else if (strcmp(extension, "jpg") == 0) {
 					HEADER("content-type", "image/jpg");
+					// For the tiled images test
+					HEADER("cache-control", "no-cache, no-store"); 
+				}
 			}
 
 			struct stat statbuf;
