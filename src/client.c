@@ -100,6 +100,11 @@ void client_close_immediate(struct client *client) {
 	client_free(client);
 }
 
+static bool is_protocol_correct(struct client *client) {
+	log_debug("Negotiated protocol: %s", s2n_get_application_protocol(client->tls));
+	return strcmp("h2", s2n_get_application_protocol(client->tls)) == 0;
+}
+
 static void initiate_graceful_close(struct client *client) {
 	client->is_closing = true;
 	if (client->state == HH_NEGOTIATING_TLS || client->state == HH_ALREADY_CLOSED)
@@ -280,6 +285,14 @@ static int do_negotiate(struct client *client) {
 				log_warn("Call to s2n_negotiate failed (%s)", s2n_strerror(s2n_errno, "EN"));
 				return blind_client(client, s2n_connection_get_delay(client->tls));
 		}
+	}
+	if (client->blocked == S2N_NOT_BLOCKED) {
+		if (!is_protocol_correct(client)) {
+			// HTTP/2 was not negotiated, close the connection (TODO: with an alert or message?)
+			return -1;	
+		}
+		// Might we need to check that there is no more data available?
+		change_state(client, HH_WAITING_MAGIC);
 	}
 	return 0;
 }
@@ -1004,8 +1017,6 @@ int client_on_write_ready(struct client *client) {
 				break;
 			if (do_negotiate(client) < 0)
 				goto error;
-			if (client->blocked == S2N_NOT_BLOCKED)
-				change_state(client, HH_WAITING_MAGIC);
 			break;
 		case HH_WAITING_SETTINGS: // Keep sending SETTINGS frame
 		case HH_IDLE:
@@ -1041,14 +1052,11 @@ int client_on_data_received(struct client *client) {
 	switch (client->state) {
 		case HH_NEGOTIATING_TLS:
 			if (client->blocked == S2N_BLOCKED_ON_WRITE) {
-				fprintf(stderr, "Unexpected data on client socket\n");
+				log_warn("Unexpected data on client socket\n");
 				goto error;
 			}
 			if (do_negotiate(client) < 0)
 				goto error;
-			if (client->blocked == S2N_NOT_BLOCKED)
-				// Might we need to check that there is no more data available?
-				change_state(client, HH_WAITING_MAGIC);
 			break;
 		case HH_WAITING_MAGIC:
 		case HH_WAITING_SETTINGS:

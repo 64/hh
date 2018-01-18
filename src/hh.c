@@ -315,7 +315,7 @@ static void *worker_event_loop(void *state) {
 			}
 			if (client->is_closing) {
 				if (client_close_graceful(client) < 0) {
-					client_close_immediate(client);	
+					client_close_immediate(client);
 				}
 			}
 		}
