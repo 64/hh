@@ -101,7 +101,6 @@ void client_close_immediate(struct client *client) {
 }
 
 static bool is_protocol_correct(struct client *client) {
-	log_debug("Negotiated protocol: %s", s2n_get_application_protocol(client->tls));
 	return strcmp("h2", s2n_get_application_protocol(client->tls)) == 0;
 }
 
@@ -364,7 +363,7 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 	strcpy(pathbuf, "data/static");
 	strcat(pathbuf, stream->req.pathbuf); // Won't overflow since we terminated it at REQ_MAX_PATH - 1
 
-	//log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
+	log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
 	stream->req.pathptr = &pathbuf[0];
 	// Prevent directory traversal attacks
 	if (strstr(stream->req.pathbuf, "../") != NULL) {
@@ -378,7 +377,7 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 			stream->req.status_code = 500;
 	} else
 		stream->req.status_code = 200;
-	assert(stream->req.status_code == 200 || stream->req.fd == -1);
+	assert(stream->req.fd != -1 || stream->req.status_code != 200);
 
 	// Send headers for request
 	request_send_headers(client, stream);
@@ -522,7 +521,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					ib->remaining = HH_HEADER_SIZE;
 					continue;
 				}
-				__attribute__((fallthrough));
+				// fallthrough
 			} case HH_FRAME_PAYLOAD: {
 				// Read as much as we can into payload buffer
 				size_t read_length = MIN(remaining_len, ib->remaining);
@@ -646,7 +645,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 								client->settings.initial_window_size = value;
 								break;
 							case 5:
-								if (value < (1 << 16) || value > ((1 << 24) - 1)) {
+								if (value < (1 << 14) || value > ((1 << 24) - 1)) {
 									send_goaway(client, HH_ERR_PROTOCOL);
 									goto goaway;
 								}
@@ -715,7 +714,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					send_goaway(client, HH_ERR_PROTOCOL);
 					goto goaway;
 				}
-				__attribute__((fallthrough));
+				// fallthrough
 			case HH_FT_HEADERS: {
 				uint8_t *new_stream_pri_info = NULL;
 				uint8_t *decode_start = (uint8_t *)ib->payload;
@@ -755,11 +754,12 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 					decode_start += 5;
 				}
 				stream = update_stream(client, stream, ib->header.stream_id, new_stream_pri_info, HH_STREAM_OPEN);
-				if (stream == NULL) {
-					// Circular dependency
+				if (stream == NULL || stream->req.state != HH_REQ_NOT_STARTED) {
+					// Circular dependency or tried to send on an active stream
 					send_rst_stream(client, ib->header.stream_id, HH_ERR_PROTOCOL);
 					goto rst_stream;
 				}
+				assert(stream->req.state == HH_REQ_NOT_STARTED);
 				struct hpack_decoding dec = {
 					.blk = decode_start,
 					.blk_len = decode_len,
@@ -837,8 +837,7 @@ static int parse_frame(struct client *client, char *buf, size_t len) {
 							ib->header.length - 8,
 							&ib->payload[8]);
 #endif
-				return -1; // Shutdown gracefully now
-				break;
+				return -1;
 			case HH_FT_RST_STREAM:
 				if (ib->header.length != 4) {
 					send_goaway(client, HH_ERR_FRAME_SIZE);

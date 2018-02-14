@@ -86,6 +86,7 @@ struct stream *stream_alloc(void) {
 	memset(rv, 0, sizeof *rv);
 	rv->state = HH_STREAM_IDLE;
 	rv->req.fd = -1;
+	rv->req.state = HH_REQ_NOT_STARTED;
 	return rv;
 }
 

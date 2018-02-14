@@ -76,9 +76,10 @@ void request_send_headers(struct client *client, struct stream *stream) {
 
 	assert(pos < MAX_HEADER_FIELDS);
 
-	if (end_stream)
+	if (end_stream) {
 		stream_change_state(stream, HH_STREAM_HCLOSED_LOCAL);
-	else
+		//stream->req.state = HH_REQ_DONE;
+	} else
 		stream->req.state = HH_REQ_IN_PROGRESS;
 
 	if (send_headers(client, stream->id, fields, pos, end_stream) != 0)
@@ -87,6 +88,7 @@ void request_send_headers(struct client *client, struct stream *stream) {
 
 // TODO: Padding etc
 int request_fulfill(struct stream *s, uint8_t *buf, size_t *max_size) {
+	assert(s->req.status_code == 200);
 	assert(s->req.fd != -1);
 	assert(*max_size != 0 && *max_size + HH_HEADER_SIZE < (1 << 25));
 	assert(*max_size > HH_HEADER_SIZE); // TODO: Remove this assert

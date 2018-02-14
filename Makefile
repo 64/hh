@@ -4,7 +4,7 @@ SRC := src
 TEST := test
 EXE := hh
 
-CFLAGS += -Wall -Wextra -Werror=implicit-function-declaration -std=gnu11 -Iinclude
+CFLAGS += -Wall -Wextra -Werror=implicit-function-declaration -std=gnu11 -Iinclude -Wno-implicit-fallthrough
 LDLIBS += -ls2n -lcrypto -pthread -l:libhpack.a
 
 SRCS := $(shell find $(SRC) -name "*.c")
