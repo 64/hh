@@ -66,6 +66,7 @@ void request_send_headers(struct client *client, struct stream *stream) {
 			} else {
 				snprintf(content_length, 10, "%zu", statbuf.st_size);
 				HEADER("content-length", content_length);
+				stream->req.bytes_remaining = statbuf.st_size;
 			}
 
 			break;
@@ -98,13 +99,15 @@ int request_fulfill(struct stream *s, uint8_t *buf, size_t *max_size) {
 	uint32_t total_nwritten = 0;
 	uint8_t flags = 0;
 	while ((nwritten = read(s->req.fd, ptr, remaining)) > 0) {
-		remaining -= (size_t)nwritten;
-		ptr += nwritten;
-		total_nwritten += (uint32_t)nwritten;
+		size_t abs_nwritten = (nwritten > 0) ? (size_t)nwritten : 0;
+		remaining -= abs_nwritten;
+		s->req.bytes_remaining -= abs_nwritten;
+		ptr += abs_nwritten;
+		total_nwritten += abs_nwritten;
 		if (remaining == 0)
 			break;
 	}
-	if (nwritten == 0) {
+	if (nwritten == 0 || s->req.bytes_remaining == 0) {
 		// EOF, set END_STREAM and close
 		// Will automagically go to HH_STREAM_CLOSED if already in HH_STREAM_HCLOSED_REMOTE
 		stream_change_state(s, HH_STREAM_HCLOSED_LOCAL);

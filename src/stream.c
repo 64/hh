@@ -4,7 +4,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <assert.h>
+#include <limits.h>
 #include "stream.h"
+#include "util.h"
 #include "log.h"
 
 #define STREAMTAB_INITIAL_LEN 64
@@ -58,7 +60,7 @@ struct stream *streamtab_find_id(struct streamtab *tab, uint32_t stream_id) {
 static struct stream *find_active(struct stream *s) {
 	if (s == NULL)
 		return NULL;
-	else if (s->req.state == HH_REQ_IN_PROGRESS)
+	else if (s->req.state == HH_REQ_IN_PROGRESS && s->window_size > 0)
 		return s;
 	struct stream *rv = find_active(s->siblings);
 	if (rv != NULL)
@@ -66,8 +68,15 @@ static struct stream *find_active(struct stream *s) {
 	return find_active(s->children);
 }
 
-struct stream *streamtab_schedule(struct streamtab *tab) {
-	return find_active(streamtab_root(tab));
+struct stream *streamtab_schedule(struct streamtab *tab, size_t *out_bytes) {
+	struct stream *stream = find_active(streamtab_root(tab));
+	if (stream == NULL)
+		return NULL;
+	// TODO: Padding for DATA frames needs to be taken into account for flow control if added in the future
+	size_t max_read = MIN(MIN(stream->window_size, *out_bytes), stream->req.bytes_remaining);
+	stream->window_size -= max_read;
+	*out_bytes = max_read;
+	return stream;
 }
 
 void streamtab_free(struct streamtab *tab) {

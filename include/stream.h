@@ -38,7 +38,7 @@ struct streamtab {
 
 void streamtab_alloc(struct streamtab *);
 void streamtab_insert(struct streamtab *, struct stream *);
-struct stream *streamtab_schedule(struct streamtab *);
+struct stream *streamtab_schedule(struct streamtab *, size_t *);
 struct stream *streamtab_find_id(struct streamtab *, uint32_t);
 void streamtab_free(struct streamtab *);
 

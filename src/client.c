@@ -925,7 +925,8 @@ static int signal_epollout(struct client *client, bool on) {
 }
 
 bool client_pending_write(struct client *client) {
-	return (pqueue_is_data_pending(&client->pqueue)) || (streamtab_schedule(&client->streams) != NULL);
+	size_t dummy;
+	return (pqueue_is_data_pending(&client->pqueue)) || (streamtab_schedule(&client->streams, &dummy) != NULL);
 }
 
 int client_write_flush(struct client *client) {
@@ -943,14 +944,21 @@ int client_write_flush(struct client *client) {
 			return 0;
 		}
 
+
 		// Check if we have any DATA frames to write
 		if (out == NULL) {
+			// If we have exhausted the client's window, stop sending
+			if (client->window_size == 0)
+				return 0;
 			// Nothing to write - fulfil a request by sending DATA
-			// TODO: Implement flow control
-			struct stream *s = streamtab_schedule(&client->streams);
+			size_t size_requested = MIN(DATA_BUF_SIZE, client->window_size);
+			struct stream *s = streamtab_schedule(&client->streams, &size_requested);
 			if (s == NULL) // Otherwise, we have nothing to write
 				return 0;
-			size_t size_requested = DATA_BUF_SIZE;
+			assert(size_requested > 0);
+			size_requested = MIN(size_requested + HH_HEADER_SIZE, DATA_BUF_SIZE);
+			assert(client->window_size >= size_requested);
+			client->window_size -= size_requested;
 			if (request_fulfill(s, (uint8_t *)buf, &size_requested) < 0) {
 				// TODO: Send RST_STREAM
 				return -1;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stddef.h>
+
 struct client;
 struct stream;
 
@@ -9,6 +11,7 @@ struct request {
 	struct client *client; // Client who initiated the request
 	struct request *next;
 	int fd; // File descriptor of whatever resource is being accessed
+	size_t bytes_remaining; // How many more bytes we need to read from the file
 	union {
 		char pathbuf[REQ_MAX_PATH]; // Path to the file being accessed
 		char *pathptr;
