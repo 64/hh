@@ -72,8 +72,11 @@ struct stream *streamtab_schedule(struct streamtab *tab, size_t *out_bytes) {
 	struct stream *stream = find_active(streamtab_root(tab));
 	if (stream == NULL)
 		return NULL;
+	if (*out_bytes == ULONG_MAX) // Dummy call
+		return stream;
 	// TODO: Padding for DATA frames needs to be taken into account for flow control if added in the future
 	size_t max_read = MIN(MIN(stream->window_size, *out_bytes), stream->req.bytes_remaining);
+	log_debug("Active streams, reading %zu", max_read);
 	stream->window_size -= max_read;
 	*out_bytes = max_read;
 	return stream;

@@ -925,7 +925,7 @@ static int signal_epollout(struct client *client, bool on) {
 }
 
 bool client_pending_write(struct client *client) {
-	size_t dummy;
+	size_t dummy = ULONG_MAX;
 	return (pqueue_is_data_pending(&client->pqueue)) || (streamtab_schedule(&client->streams, &dummy) != NULL);
 }
 
@@ -951,14 +951,14 @@ int client_write_flush(struct client *client) {
 			if (client->window_size == 0)
 				return 0;
 			// Nothing to write - fulfil a request by sending DATA
-			size_t size_requested = MIN(DATA_BUF_SIZE, client->window_size);
+			size_t size_requested = MIN(DATA_BUF_SIZE - HH_HEADER_SIZE, client->window_size);
 			struct stream *s = streamtab_schedule(&client->streams, &size_requested);
 			if (s == NULL) // Otherwise, we have nothing to write
 				return 0;
 			assert(size_requested > 0);
-			size_requested = MIN(size_requested + HH_HEADER_SIZE, DATA_BUF_SIZE);
 			assert(client->window_size >= size_requested);
 			client->window_size -= size_requested;
+			size_requested += HH_HEADER_SIZE;
 			if (request_fulfill(s, (uint8_t *)buf, &size_requested) < 0) {
 				// TODO: Send RST_STREAM
 				return -1;
