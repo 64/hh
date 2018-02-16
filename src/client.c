@@ -364,7 +364,7 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 	strcpy(pathbuf, "data/static");
 	strcat(pathbuf, stream->req.pathbuf); // Won't overflow since we terminated it at REQ_MAX_PATH - 1
 
-	log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
+	log_debug("GET %s (%d)", pathbuf + strlen("data/static/") - 1, stream->id);
 	stream->req.pathptr = &pathbuf[0];
 	// Prevent directory traversal attacks
 	if (strstr(stream->req.pathbuf, "../") != NULL) {
@@ -919,6 +919,7 @@ static int signal_epollout(struct client *client, bool on) {
 	struct epoll_event ev;
 	ev.data.ptr = client;
 	ev.events = CLIENT_EPOLL_EVENTS;
+	log_debug("Signal EPOLLOUT %d", on);
 	if (on)	ev.events |= EPOLLOUT;
 	if (epoll_ctl(thread_state.epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) < 0)
 		return -1;
@@ -947,15 +948,16 @@ int client_write_flush(struct client *client) {
 
 
 		// Check if we have any DATA frames to write
+		struct stream *s = NULL;
 		if (out == NULL) {
 			// If we have exhausted the client's window, stop sending
 			if (client->window_size == 0)
 				return 0;
 			// Nothing to write - fulfil a request by sending DATA
 			size_t size_requested = MIN(DATA_BUF_SIZE - HH_HEADER_SIZE, client->window_size);
-			struct stream *s = streamtab_schedule(&client->streams, &size_requested);
+			s = streamtab_schedule(&client->streams, &size_requested);
 			if (s == NULL) // Otherwise, we have nothing to write
-				return 0;
+				break;	
 			assert(size_requested > 0);
 			assert(client->window_size >= size_requested);
 			client->window_size -= size_requested;
@@ -990,9 +992,10 @@ int client_write_flush(struct client *client) {
 			// A DATA frame was sent
 			// Malloc and push onto write queue for later
 			size_t remaining = out_len - nwritten;
-			if (remaining == 0)
+			log_debug("Sent DATA frame on %u (%zu bytes remaining)", s->id, remaining);
+			if (remaining == 0) {
 				out = NULL;
-			else {
+			} else {
 				// TODO: Don't copy the whole 16k here if possible
 				out = pqueue_node_alloc(out_len);
 				memcpy(out->data, buf, out_len);
@@ -1005,6 +1008,7 @@ int client_write_flush(struct client *client) {
 
 	// If we still have data remaining, signal EPOLLOUT
 	bool pending = client_pending_write(client);
+	log_debug("Pending %u, blocked %u", pending, client->is_write_blocked);
 	if (pending && !client->is_write_blocked) {
 		client->is_write_blocked = true;
 		if (signal_epollout(client, true) < 0)

@@ -40,6 +40,13 @@ static size_t frame_size(struct pqueue_node *frame) {
 	return (size_t)tmp + HH_HEADER_SIZE;
 }
 
+static void debug_log_frame(struct pqueue_node *frame) {
+	uint8_t  type = frame->data[3];
+	uint32_t s_id = 0;
+	memcpy(&s_id, frame->data + 5, 4);
+	s_id = ntohl(s_id);
+	log_debug("Type %u, ID %u", type, s_id);
+}
 
 int pqueue_submit_frame(struct pqueue *pqueue, struct pqueue_node *frame, enum pqueue_pri priority) {
 	struct pqueue_node **head = NULL, *tmp;
@@ -129,6 +136,8 @@ int pqueue_report_write(struct pqueue *pqueue, struct pqueue_node *frame, size_t
 		log_trace();
 		abort();
 	}
+
+	debug_log_frame(frame);
 
 	frame->nwritten += len_written;
 	if (frame->nwritten >= frame_size(frame)) {

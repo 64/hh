@@ -33,6 +33,20 @@ void streamtab_alloc(struct streamtab *tab) {
 	tab->root->req.fd = -1;
 }
 
+static void __print_streams(struct stream *s, int depth) {
+	if (s == NULL)
+		return;
+	if (s->req.state != HH_REQ_DONE)
+		log_debug("%*sStream ID %u, Req %u", depth, "", s->id, s->req.state);
+	__print_streams(s->children, depth/* + 1*/);
+	__print_streams(s->siblings, depth);
+}
+
+static void print_streams(struct streamtab *tab) {
+	struct stream *stream = streamtab_root(tab);
+	__print_streams(stream, 0);
+}
+
 /*static void resize(struct streamtab *tab) {
 	(void)tab;
 }*/
@@ -44,6 +58,7 @@ void streamtab_insert(struct streamtab *tab, struct stream *stream) {
 	stream->next = tab->streams[idx];
 	tab->streams[idx] = stream;
 	tab->entries++;
+	print_streams(tab);
 }
 
 struct stream *streamtab_find_id(struct streamtab *tab, uint32_t stream_id) {
@@ -103,23 +118,16 @@ struct stream *stream_alloc(void) {
 
 void stream_add_child(struct stream *stream, struct stream *child) {
 	assert(child->parent == NULL);
+	assert(child->siblings == NULL);
+	assert(child->children == NULL);
 	child->parent = stream;
-	if (stream->children == NULL) {
-		stream->children = child;
-	} else {
-		// TODO: Make this O(1) since it's a bit of a bottleneck
-		struct stream *start = child->children;
-		if (start != NULL) {
-			while (start->siblings != NULL)
-				start = start->siblings;
-			start->siblings = stream->siblings;
-		}
-		stream->siblings = child;
-	}
+	child->siblings = stream->children;
+	stream->children = child;
 }
 
 void stream_add_exclusive_child(struct stream *stream, struct stream *child) {
 	assert(child->parent == NULL);
+	assert(child->siblings == NULL);
 	assert(child->children == NULL);
 	child->parent = stream;
 	if (stream->children == NULL)
