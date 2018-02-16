@@ -33,6 +33,7 @@ void streamtab_alloc(struct streamtab *tab) {
 	tab->root->req.fd = -1;
 }
 
+#if 0
 static void __print_streams(struct stream *s, int depth) {
 	if (s == NULL)
 		return;
@@ -47,9 +48,10 @@ static void print_streams(struct streamtab *tab) {
 	__print_streams(stream, 0);
 }
 
-/*static void resize(struct streamtab *tab) {
+static void resize(struct streamtab *tab) {
 	(void)tab;
-}*/
+}
+#endif
 
 void streamtab_insert(struct streamtab *tab, struct stream *stream) {
 	// TODO: Resize if load is too high
@@ -58,7 +60,6 @@ void streamtab_insert(struct streamtab *tab, struct stream *stream) {
 	stream->next = tab->streams[idx];
 	tab->streams[idx] = stream;
 	tab->entries++;
-	print_streams(tab);
 }
 
 struct stream *streamtab_find_id(struct streamtab *tab, uint32_t stream_id) {

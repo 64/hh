@@ -364,7 +364,7 @@ static int finalise_request(struct client *client, struct stream *stream, bool *
 	strcpy(pathbuf, "data/static");
 	strcat(pathbuf, stream->req.pathbuf); // Won't overflow since we terminated it at REQ_MAX_PATH - 1
 
-	log_debug("GET %s (%d)", pathbuf + strlen("data/static/") - 1, stream->id);
+	log_debug("GET %s", pathbuf + strlen("data/static/") - 1);
 	stream->req.pathptr = &pathbuf[0];
 	// Prevent directory traversal attacks
 	if (strstr(stream->req.pathbuf, "../") != NULL) {
@@ -919,7 +919,6 @@ static int signal_epollout(struct client *client, bool on) {
 	struct epoll_event ev;
 	ev.data.ptr = client;
 	ev.events = CLIENT_EPOLL_EVENTS;
-	log_debug("Signal EPOLLOUT %d", on);
 	if (on)	ev.events |= EPOLLOUT;
 	if (epoll_ctl(thread_state.epoll_fd, EPOLL_CTL_MOD, client->fd, &ev) < 0)
 		return -1;
@@ -992,7 +991,6 @@ int client_write_flush(struct client *client) {
 			// A DATA frame was sent
 			// Malloc and push onto write queue for later
 			size_t remaining = out_len - nwritten;
-			log_debug("Sent DATA frame on %u (%zu bytes remaining)", s->id, remaining);
 			if (remaining == 0) {
 				out = NULL;
 			} else {
@@ -1008,7 +1006,6 @@ int client_write_flush(struct client *client) {
 
 	// If we still have data remaining, signal EPOLLOUT
 	bool pending = client_pending_write(client);
-	log_debug("Pending %u, blocked %u", pending, client->is_write_blocked);
 	if (pending && !client->is_write_blocked) {
 		client->is_write_blocked = true;
 		if (signal_epollout(client, true) < 0)
