@@ -102,7 +102,10 @@ void client_close_immediate(struct client *client) {
 }
 
 static bool is_protocol_correct(struct client *client) {
-	return strcmp("h2", s2n_get_application_protocol(client->tls)) == 0;
+	const char *proto = s2n_get_application_protocol(client->tls);
+	if (proto == NULL)
+		return false;
+	return strcmp("h2", proto) == 0;
 }
 
 static void initiate_graceful_close(struct client *client) {
