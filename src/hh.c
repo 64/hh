@@ -131,6 +131,7 @@ static int queue_fd(int event_fd, int client_fd) {
 		pthread_mutex_unlock(&fd_queue_lock);
 		return -1;
 	} else {
+		log_debug("Queued FD at %d", fd_queue_head);
 		fd_queue[fd_queue_head] = client_fd;
 		fd_queue_head = new_head;
 	}
@@ -152,6 +153,7 @@ static void consume_available_fd(int epoll_fd) {
 	if (fd_queue_tail != fd_queue_head) {
 		// Grab the FD from the queue
 		int new_fd = fd_queue[fd_queue_tail];
+		log_debug("Consumed FD at position %d", fd_queue_tail);
 		fd_queue_tail = (fd_queue_tail + 1) % MAX_FD_QUEUE;
 		pthread_mutex_unlock(&fd_queue_lock);
 

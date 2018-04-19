@@ -302,7 +302,7 @@ static int do_negotiate(struct client *client) {
 
 static int process_header(struct stream *stream, char *name, char *value, bool *stream_err) {
 	//printf("%s: %s\n", name, value);
-	// TODO: Use gprof or something to create a hash function for the strings in here
+	// TODO: Use gperf or something to create a hash function for the strings in here
 	// This is probably very slow and needs benchmarking
 	if (*name == ':') {
 		if (stream->req.pseudos.done) {
@@ -1042,6 +1042,7 @@ int client_on_write_ready(struct client *client) {
 			break;
 		case HH_TLS_SHUTDOWN:
 		case HH_ALREADY_CLOSED:
+		case HH_BLINDED:
 			break;
 		default:
 #ifdef NDEBUG
@@ -1081,7 +1082,9 @@ int client_on_data_received(struct client *client) {
 			if (do_read(client) < 0)
 				goto graceful_exit;
 			break;
-		} case HH_TLS_SHUTDOWN:
+		}
+		case HH_TLS_SHUTDOWN:
+		case HH_BLINDED:
 			// Ignore it
 			break;
 		default:
